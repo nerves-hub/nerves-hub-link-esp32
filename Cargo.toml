@@ -1,0 +1,44 @@
+[package]
+name = "nerves-hub-link-esp32"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "NervesHub device agent for ESP-IDF targets"
+license = "Apache-2.0"
+
+# The protocol layer (message codec, join payload, update payload) is plain Rust
+# and builds on the host, so `cargo test` runs it without an ESP toolchain.
+# Everything that touches the device is behind `cfg(target_os = "espidf")`.
+[dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# Only esp-idf-svc is taken directly: it re-exports `sys`, `hal` and `io`, so
+# using those through it keeps the whole esp-rs stack on one consistent version
+# instead of three that have to be kept in step by hand.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-svc = { version = "0.52", features = ["binstart"] }
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+
+[features]
+default = []
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+opt-level = "z"
+
+# `esp_websocket_client` is a managed component from the ESP component registry,
+# not part of core ESP-IDF, and `esp_idf_svc::ws::client` is cfg-gated on its
+# presence. Without this the module simply does not exist.
+#
+# IMPORTANT: esp-idf-sys only reads this metadata from the *root* crate of a
+# build. An application depending on this library must repeat this block in its
+# own Cargo.toml — it is not inherited.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "^1.0" }

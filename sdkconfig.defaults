@@ -1,0 +1,24 @@
+# Rollback is the whole reason for the two-slot layout: without it a bad image
+# that cannot reach NervesHub is unrecoverable without physical access.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# NOTE: the partition table is deliberately NOT set here. This is a library
+# crate, and esp-idf-sys builds ESP-IDF in its own output directory where a
+# relative `partitions.csv` does not exist. Your *application* sets:
+#
+#   CONFIG_PARTITION_TABLE_CUSTOM=y
+#   CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+#
+# and provides the file. `partitions.csv` here is a working example to copy.
+
+# The websocket client and TLS.
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# esp-idf-svc needs a larger main task stack than the default once TLS is in
+# the picture.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10000
+
+# Set this to the semantic version NervesHub should record. It is read from
+# esp_app_desc_t.version at upload time and must parse as SemVer.
+# (Prefer setting PROJECT_VER in CMakeLists.txt.)

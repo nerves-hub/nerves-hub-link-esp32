@@ -1,0 +1,24 @@
+# Deliberately no `[build] target` — that would make `cargo test` cross-compile
+# and break host testing. Pass --target explicitly for device builds.
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
+[env]
+# Read by esp-idf-sys when building for an espidf target; ignored on the host.
+ESP_IDF_VERSION = "v5.2.3"
+
+# Device builds need -Zbuild-std (the esp toolchain ships no prebuilt std for
+# the espidf targets). That flag cannot go in [unstable] — it would apply to
+# host builds too and break `cargo test` on stable — so it lives in aliases.
+#
+#   cargo +esp esp32s3        type-check and build for ESP32-S3
+#   cargo +esp check-esp32s3  faster, no linking
+[alias]
+esp32s3 = "build --target xtensa-esp32s3-espidf -Zbuild-std=std,panic_abort"
+check-esp32s3 = "check --target xtensa-esp32s3-espidf -Zbuild-std=std,panic_abort"
