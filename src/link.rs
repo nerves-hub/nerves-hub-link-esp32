@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
 use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::metadata::FirmwareMetadata;
 use crate::update::{Stage, UpdateDecision, UpdatePayload};
@@ -37,6 +38,9 @@ impl UpdateHandler for AlwaysApply {}
 /// Something the run loop must act on outside the channel conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    /// The platform asked for a reading only the application can produce.
+    /// The caller answers with [`Link::send_extension`].
+    Extension(Vec<Outgoing>),
     None,
     /// Download and apply this image, then reboot.
     ApplyUpdate(Box<UpdatePayload>),
@@ -49,17 +53,23 @@ pub struct Link {
     metadata: FirmwareMetadata,
     refs: RefGenerator,
     join_ref: Option<String>,
+    extensions: Extensions,
+    extensions_join_ref: Option<String>,
     joined: bool,
     downloading: Option<String>,
 }
 
 impl Link {
     pub fn new(config: Config, metadata: FirmwareMetadata) -> Self {
+        let enabled = config.extensions;
+
         Self {
             config,
             metadata,
             refs: RefGenerator::default(),
             join_ref: None,
+            extensions: Extensions::new(enabled),
+            extensions_join_ref: None,
             joined: false,
             downloading: None,
         }
@@ -177,6 +187,10 @@ impl Link {
     ) -> Result<Action, Error> {
         let message = Message::decode(frame)?;
 
+        if message.topic == EXTENSIONS_TOPIC {
+            return self.handle_extension_frame(transport, &message);
+        }
+
         match message.event.as_str() {
             event::REPLY => self.handle_reply(transport, handler, &message),
             event::UPDATE => {
@@ -185,9 +199,96 @@ impl Link {
             }
             event::CLOSE | event::ERROR => {
                 self.joined = false;
+                self.extensions.disconnected();
                 Ok(Action::Reconnect)
             }
             _ => Ok(Action::None),
+        }
+    }
+
+    /// Whether the application asked for any extension.
+    pub fn extensions_wanted(&self) -> bool {
+        self.extensions.wanted()
+    }
+
+    pub fn extensions_joined(&self) -> bool {
+        self.extensions.joined()
+    }
+
+    /// Join the extensions channel. Only after the device channel is joined —
+    /// the platform decides what to attach from the device's product, which it
+    /// knows once the device has identified itself.
+    pub fn send_extensions_join<T: Transport>(&mut self, transport: &mut T) -> Result<(), Error> {
+        let (reference, message) = self.extensions.join_message(&mut self.refs);
+        self.extensions_join_ref = Some(reference.clone());
+
+        let frame = message.with_refs(Some(reference.clone()), Some(reference)).encode()?;
+        transport.send(&frame)
+    }
+
+    /// Perform frames produced by the extensions state machine.
+    pub fn send_extension<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        outgoing: Vec<Outgoing>,
+    ) -> Result<(), Error> {
+        for out in outgoing {
+            if let Outgoing::Send { event, payload } = out {
+                let reference = self.refs.next_ref();
+                let frame = Message::new(EXTENSIONS_TOPIC, &event, payload)
+                    .with_refs(self.extensions_join_ref.clone(), Some(reference))
+                    .encode()?;
+                transport.send(&frame)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The frames answering a location request.
+    pub fn location_answer(&self, location: Option<crate::extensions::Location>) -> Vec<Outgoing> {
+        self.extensions.location(location)
+    }
+
+    /// The frames answering a health check.
+    pub fn health_answer(&self, report: &crate::extensions::HealthReport) -> Vec<Outgoing> {
+        self.extensions.health(report)
+    }
+
+    /// Send a log line, if the logging extension is attached.
+    pub fn send_log<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        line: &LogLine,
+    ) -> Result<(), Error> {
+        let outgoing = self.extensions.log(line);
+        self.send_extension(transport, outgoing)
+    }
+
+    fn handle_extension_frame<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        message: &Message,
+    ) -> Result<Action, Error> {
+        if message.event == event::REPLY {
+            let is_join_reply =
+                self.extensions_join_ref.as_deref() == message.reference.as_deref();
+
+            if is_join_reply {
+                let response = message.reply_response().cloned().unwrap_or(Value::Array(vec![]));
+                let confirmations = self.extensions.on_join_reply(&response);
+                self.send_extension(transport, confirmations)?;
+            }
+
+            return Ok(Action::None);
+        }
+
+        let outgoing = self.extensions.on_event(&message.event, &message.payload);
+
+        if outgoing.is_empty() {
+            Ok(Action::None)
+        } else {
+            Ok(Action::Extension(outgoing))
         }
     }
 

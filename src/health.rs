@@ -19,6 +19,10 @@
 //! **RSSI** is included because most field problems with a WiFi device are
 //! signal problems, and a fleet map of RSSI answers that at a glance.
 //!
+//! Uptime is deliberately absent. As a metric it is a line that only rises,
+//! which reads the same whether a fleet is stable or restarting hourly — the
+//! question it appears to answer is better answered by `reset_reason`.
+//!
 //! # CPU
 //!
 //! There is no supported way to measure CPU load on FreeRTOS without run-time
@@ -31,6 +35,7 @@
 //! CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 //! ```
 
+#[cfg(target_os = "espidf")]
 use crate::extensions::{HealthProvider, HealthReport};
 
 /// A byte count as whole megabytes, for the metric names NervesHub knows.
@@ -135,11 +140,6 @@ impl HealthProvider for EspHealth {
         for (name, value) in memory_metrics(total, free, min_free, largest) {
             report = report.metric(name, value);
         }
-
-        // Microseconds since boot; seconds is the useful granularity and keeps
-        // the number small enough to read on a chart.
-        let uptime = unsafe { sys::esp_timer_get_time() } / 1_000_000;
-        report = report.metric("uptime_seconds", uptime as f64);
 
         if let Some(rssi) = wifi_rssi() {
             report = report.metric("wifi_rssi", rssi as f64);

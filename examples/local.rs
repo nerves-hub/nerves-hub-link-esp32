@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use esp_idf_svc::sntp::{EspSntp, SyncStatus};
     use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
+    use nerves_hub_link_esp32::extensions::Enabled;
+    use nerves_hub_link_esp32::health::EspHealth;
     use nerves_hub_link_esp32::{esp, AlwaysApply, Config, Credentials};
 
     esp_idf_svc::sys::link_patches();
@@ -76,12 +78,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nh.port = config::NH_PORT;
     nh.use_tls = config::NH_USE_TLS;
 
+    // Offered, not assumed: the platform attaches this only if the product has
+    // the health extension enabled.
+    nh.extensions = Enabled::none().health();
+
     if !nh.use_tls {
         log::warn!("connecting over plain ws:// — bench use only");
     }
 
     log::info!("connecting to {}", nh.socket_url());
-    esp::agent_with(nh, AlwaysApply)?.run()?;
+    esp::agent_with(nh, AlwaysApply)?.with_health(EspHealth::new()).run()?;
 
     Ok(())
 }

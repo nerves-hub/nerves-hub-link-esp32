@@ -15,6 +15,7 @@
 use core::time::Duration;
 
 use crate::config::Config;
+use crate::extensions::{HealthProvider, LocationProvider, Outgoing};
 use crate::error::Error;
 use crate::install::{install, HttpStream, ImageSink};
 use crate::link::{Action, Link, Transport, UpdateHandler};
@@ -74,11 +75,15 @@ pub struct Agent<P, H> {
     metadata: FirmwareMetadata,
     platform: P,
     handler: H,
+    location: Option<Box<dyn LocationProvider>>,
+    health: Option<Box<dyn HealthProvider>>,
 }
 
 impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     pub fn new(config: Config, metadata: FirmwareMetadata, platform: P, handler: H) -> Self {
         Self {
+            location: None,
+            health: None,
             config,
             metadata,
             platform,
@@ -92,8 +97,57 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             config: self.config,
             metadata: self.metadata,
             platform: self.platform,
+            location: self.location,
+            health: self.health,
             handler,
         }
+    }
+
+    /// Answer `geo:location:request` with this.
+    ///
+    /// Without one the extension is offered but never answered, so set it
+    /// whenever geo is enabled.
+    pub fn with_location(mut self, provider: impl LocationProvider + 'static) -> Self {
+        self.location = Some(Box::new(provider));
+        self
+    }
+
+    /// Answer `health:check` with this.
+    pub fn with_health(mut self, provider: impl HealthProvider + 'static) -> Self {
+        self.health = Some(Box::new(provider));
+        self
+    }
+
+    /// Resolve what the platform asked for, using the application's providers.
+    fn answer_extension<T: Transport>(
+        &mut self,
+        link: &mut Link,
+        transport: &mut T,
+        needs: Vec<Outgoing>,
+    ) -> Result<(), Error> {
+        for need in needs {
+            let answer = match need {
+                Outgoing::NeedLocation => {
+                    let location = self.location.as_mut().and_then(|p| p.location());
+                    link.location_answer(location)
+                }
+                Outgoing::NeedHealth => match self.health.as_mut() {
+                    Some(provider) => {
+                        let report = provider.report();
+                        link.health_answer(&report)
+                    }
+                    // Offered health but supplied no provider: say nothing
+                    // rather than report an empty set of metrics, which would
+                    // chart as a device whose memory suddenly reads zero.
+                    None => Vec::new(),
+                },
+                other => vec![other],
+            };
+
+            link.send_extension(transport, answer)?;
+        }
+
+        Ok(())
     }
 
     /// Connect, stay connected, and apply updates. Returns only when rebooting.
@@ -136,6 +190,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         link.send_join(transport)?;
 
         let mut confirmed = false;
+        let mut extensions_joined = false;
         let mut last_heartbeat = self.platform.now_ms();
         let heartbeat_ms = self.config.heartbeat_interval_secs * 1_000;
 
@@ -143,6 +198,14 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             if link.joined() && !confirmed {
                 self.confirm_running_image(&mut link, transport)?;
                 confirmed = true;
+            }
+
+            // Only after the device channel is joined: the platform decides
+            // what to attach from the device's product, which it knows once the
+            // device has said who it is.
+            if link.joined() && link.extensions_wanted() && !extensions_joined {
+                link.send_extensions_join(transport)?;
+                extensions_joined = true;
             }
 
             let now = self.platform.now_ms();
@@ -166,6 +229,9 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                     }
                 }
                 Ok(Action::Reconnect) => return Ok(None),
+                Ok(Action::Extension(needs)) => {
+                    self.answer_extension(&mut link, transport, needs)?;
+                }
                 Ok(Action::None) => {}
                 Err(_) => return Ok(None),
             }
@@ -501,6 +567,52 @@ mod tests {
 
         assert_eq!(shared.borrow().marked_valid, 0);
         assert!(events(&shared).contains(&"firmware_validated".to_string()));
+    }
+
+    // Extensions are joined on their own channel, and only after the device
+    // channel is up: the platform decides what to attach from the device's
+    // product, which it does not know until the device has identified itself.
+    #[test]
+    fn extensions_are_joined_after_the_device_channel() {
+        use crate::extensions::{Enabled, HealthReport};
+
+        struct FakeHealth;
+        impl crate::extensions::HealthProvider for FakeHealth {
+            fn report(&mut self) -> HealthReport {
+                HealthReport::default().metric("mem_used_percent", 42.0)
+            }
+        }
+
+        let mut cfg = config();
+        cfg.extensions = Enabled::none().health();
+
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            // The extensions join reply: the platform attached health. Ref 3
+            // because references run join(1), firmware_validated(2), then this
+            // join — and the reply is only accepted if the reference matches,
+            // so a stale reply cannot attach anything.
+            Ok(Some(
+                r#"["3","3","extensions","phx_reply",{"status":"ok","response":["health"]}]"#
+                    .to_string(),
+            )),
+            // And then asks for a report.
+            Ok(Some(r#"[null,null,"extensions","health:check",{}]"#.to_string())),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport);
+
+        let sent = shared.borrow().sent.clone();
+
+        // Offered health, confirmed the attach, and answered the check.
+        assert!(sent.iter().any(|f| f.contains("\"extensions\"") && f.contains("phx_join")));
+        assert!(sent.iter().any(|f| f.contains("health:attached")));
+
+        let report = sent.iter().find(|f| f.contains("health:report")).expect("no report sent");
+        assert!(report.contains("mem_used_percent"));
     }
 
     #[test]

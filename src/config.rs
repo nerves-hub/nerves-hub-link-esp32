@@ -3,6 +3,7 @@
 use std::ffi::{CStr, CString};
 
 use crate::error::Error;
+use crate::extensions::Enabled;
 use crate::shared_secret::SharedSecret;
 use crate::message::{DEVICE_API_VERSION, SERIALIZER_VSN};
 
@@ -105,6 +106,9 @@ pub struct Config {
     pub reconnect_backoff_secs: Vec<u64>,
     /// Report download progress every N percent.
     pub progress_step_percent: u8,
+    /// Which extensions to offer. None by default — an extension sends data an
+    /// operator may not expect a device to send, so it is asked for explicitly.
+    pub extensions: Enabled,
 }
 
 impl Config {
@@ -119,6 +123,7 @@ impl Config {
             heartbeat_interval_secs: 30,
             reconnect_backoff_secs: vec![1, 2, 5, 10, 30, 60],
             progress_step_percent: 5,
+            extensions: Enabled::none(),
         }
     }
 
