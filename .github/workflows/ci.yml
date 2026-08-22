@@ -84,5 +84,13 @@ jobs:
           key: esp-idf-${{ matrix.target }}-${{ hashFiles('.cargo/config.toml', 'components_*.lock', 'Cargo.toml') }}
           restore-keys: esp-idf-${{ matrix.target }}-
 
+      # `examples/local.rs` includes `local_config.rs`, which is gitignored
+      # because it holds a WiFi password and a NervesHub secret. Using the
+      # template means the example is checked and the template is proved to
+      # still satisfy it -- an onboarding file that stopped compiling would
+      # otherwise be found by the next person following the README.
+      - name: Provide bench configuration
+        run: cp local_config.rs.template local_config.rs
+
       - name: Type-check the crate and the examples
         run: cargo ${{ matrix.alias }} --all-targets
