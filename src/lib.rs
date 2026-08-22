@@ -59,6 +59,7 @@ pub mod metadata;
 pub mod ota;
 pub mod transport;
 pub mod update;
+pub mod whenwhere;
 
 pub use agent::{Agent, Platform, Stopped};
 pub use config::{Config, Credentials};
