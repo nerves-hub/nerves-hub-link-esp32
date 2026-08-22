@@ -1,8 +1,14 @@
 //! WebSocket transport over ESP-IDF's `esp_websocket_client`.
 //!
-//! **Not yet built or run.** The structure is right and the mTLS wiring is the
-//! interesting part, but the `esp-idf-svc` API surface here needs checking
-//! against the version you actually build with.
+//! # Who owns reconnection
+//!
+//! The agent does, and the IDF client is told not to. Left to itself the
+//! client re-establishes the socket on its own after a close, which sounds
+//! helpful and is not: the new socket carries no Phoenix channel, because
+//! nothing sent `phx_join` on it. NervesHub records a device connection when
+//! the *socket* connects, so the device reappears as online while being deaf
+//! to everything -- no updates, no commands. Only the agent can rebuild a
+//! session, so only the agent reconnects.
 //!
 //! # Why mTLS
 //!
@@ -34,15 +40,25 @@ use crate::config::{Config, Credentials};
 use crate::error::Error;
 use crate::link::Transport;
 
+/// What the client's callback hands to the run loop.
+///
+/// A close has to travel the same channel as the frames, in order with them:
+/// the run loop learns the socket is gone at the point it would have read the
+/// next frame, rather than by a flag it might check at the wrong moment.
+enum Incoming {
+    Text(String),
+    Closed,
+}
+
 pub struct WebSocketTransport {
     client: EspWebSocketClient<'static>,
-    incoming: Receiver<String>,
+    incoming: Receiver<Incoming>,
     recv_timeout: Duration,
 }
 
 impl WebSocketTransport {
     pub fn connect(config: &Config) -> Result<Self, Error> {
-        let (tx, rx): (Sender<String>, Receiver<String>) = channel();
+        let (tx, rx): (Sender<Incoming>, Receiver<Incoming>) = channel();
 
         // Both authentication modes are just configuration on the same client:
         // a certificate mbedTLS presents during the handshake, or headers sent
@@ -85,6 +101,10 @@ impl WebSocketTransport {
             // alive server-side.
             ping_interval_sec: Duration::from_secs(config.heartbeat_interval_secs),
 
+            // See the module docs. A socket the agent did not open is a socket
+            // with no channel joined on it.
+            disable_auto_reconnect: true,
+
             ..Default::default()
         };
 
@@ -124,14 +144,32 @@ impl WebSocketTransport {
     }
 }
 
-// Text frames are forwarded to the run loop; everything else is the transport's
-// own business. A frame that is not valid UTF-8 is dropped rather than killing
-// the connection — Phoenix only ever sends text on this socket.
-fn handle_event(tx: &Sender<String>, event: &Result<WebSocketEvent<'_>, EspIOError>) {
-    let Ok(event) = event else { return };
+// Text frames and the end of the socket are the run loop's business; pings,
+// pongs, and the handshake are the transport's own. Binary is ignored because
+// Phoenix only ever sends text on this socket.
+//
+// Forwarding the close is the whole point of this function. Without it the
+// channel stays open with nothing ever arriving on it, `recv` reports an idle
+// socket forever, and the agent waits out the rest of its life for a frame
+// from a connection that ended.
+fn handle_event(tx: &Sender<Incoming>, event: &Result<WebSocketEvent<'_>, EspIOError>) {
+    // An `Err` here is the client's ERROR event. Whatever caused it, the
+    // socket does not come back from it.
+    let Ok(event) = event else {
+        let _ = tx.send(Incoming::Closed);
+        return;
+    };
 
-    if let WebSocketEventType::Text(text) = event.event_type {
-        let _ = tx.send(text.to_string());
+    match event.event_type {
+        WebSocketEventType::Text(text) => {
+            let _ = tx.send(Incoming::Text(text.to_string()));
+        }
+        WebSocketEventType::Disconnected
+        | WebSocketEventType::Close(_)
+        | WebSocketEventType::Closed => {
+            let _ = tx.send(Incoming::Closed);
+        }
+        _ => {}
     }
 }
 
@@ -146,7 +184,9 @@ impl Transport for WebSocketTransport {
 
     fn recv(&mut self) -> Result<Option<String>, Error> {
         match self.incoming.recv_timeout(self.recv_timeout) {
-            Ok(frame) => Ok(Some(frame)),
+            Ok(Incoming::Text(frame)) => Ok(Some(frame)),
+            Ok(Incoming::Closed) => Err(Error::Transport("websocket closed".into())),
+            // Nothing arrived, which is what most half-seconds look like.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 Err(Error::Transport("websocket closed".into()))

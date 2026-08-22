@@ -198,9 +198,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
             };
 
-            match self.session(&mut transport)? {
-                Some(stopped) => return Ok(stopped),
-                None => continue,
+            match self.session(&mut transport) {
+                Ok(Some(stopped)) => return Ok(stopped),
+                Ok(None) => continue,
+                // Every send in a session is written as `?`, so a socket that
+                // dies mid-write arrives here. That is a reconnect, not the end
+                // of the agent: a device that stops talking to NervesHub
+                // because one heartbeat missed its socket is a device that
+                // needs a site visit.
+                Err(Error::Transport(_)) => continue,
+                Err(err) => return Err(err),
             }
         }
     }
@@ -398,10 +405,17 @@ mod tests {
     struct FakeTransport {
         shared: Rc<RefCell<Shared>>,
         incoming: Rc<RefCell<Vec<Incoming>>>,
+        /// A socket that has gone away under a write, which is what a close
+        /// racing a heartbeat looks like from the sending side.
+        send_fails: bool,
     }
 
     impl Transport for FakeTransport {
         fn send(&mut self, frame: &str) -> Result<(), Error> {
+            if self.send_fails {
+                return Err(Error::Transport("closed".into()));
+            }
+
             self.shared.borrow_mut().sent.push(frame.to_string());
             Ok(())
         }
@@ -454,6 +468,7 @@ mod tests {
         image: Vec<u8>,
         connect_failures: usize,
         clock_ms: u64,
+        send_fails: bool,
     }
 
     impl Platform for FakePlatform {
@@ -480,6 +495,7 @@ mod tests {
             Ok(FakeTransport {
                 shared: Rc::clone(&self.shared),
                 incoming: Rc::new(RefCell::new(frames)),
+                send_fails: self.send_fails,
             })
         }
 
@@ -557,6 +573,7 @@ mod tests {
             image: vec![],
             connect_failures: 0,
             clock_ms: 0,
+            send_fails: false,
         }
     }
 
@@ -567,6 +584,31 @@ mod tests {
             .iter()
             .map(|frame| Message::decode(frame).unwrap().event)
             .collect()
+    }
+
+    // A socket can die between the run loop deciding to write and the write
+    // landing -- which is exactly what a NervesHub "reconnect" does. The agent
+    // must treat that as a reconnect. Ending the run instead would leave a
+    // device off NervesHub until someone power-cycled it.
+    #[test]
+    fn a_send_that_fails_reconnects_instead_of_ending_the_run() {
+        let mut plat = platform(vec![
+            vec![join_reply(json!({"update_available": false}))],
+            vec![join_reply(json!({"update_available": false}))],
+        ]);
+        plat.send_fails = true;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = Agent::new(config(), metadata(), plat, AlwaysApply);
+
+        // The scripted sessions run out, and `connect` then reports an identity
+        // error, which is the fixture's way of stopping the loop. Reaching it
+        // proves the agent kept reconnecting rather than returning on the first
+        // failed write.
+        assert!(matches!(agent.run(), Err(Error::Identity(_))));
+
+        // Two scripted sessions plus the connect that ends the run.
+        assert_eq!(shared.borrow().connects, 3);
     }
 
     #[test]
