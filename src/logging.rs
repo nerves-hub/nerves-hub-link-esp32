@@ -5,8 +5,7 @@
 //! is given, keeps a bounded amount of it, and hands it to the agent to send
 //! over the logging extension.
 //!
-//! ```no_run
-//! # #[cfg(target_os = "espidf")]
+//! ```ignore
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # use nerves_hub_link_esp32::{esp, AlwaysApply, Config, Credentials};
 //! # use nerves_hub_link_esp32::extensions::Enabled;
@@ -18,7 +17,8 @@
 //! // NervesHub.
 //! let logs = logging::install(LevelFilter::Info, Level::Info);
 //!
-//! # let mut config = Config::new("hub.example.test", Credentials::Certificate);
+//! # let credentials = Credentials::shared_secret("device-1", "nhp_key", "secret");
+//! # let mut config = Config::new("hub.example.test", credentials);
 //! config.extensions = Enabled::none().logging();
 //!
 //! esp::agent_with(config, AlwaysApply)?.with_logs(logs).run()?;

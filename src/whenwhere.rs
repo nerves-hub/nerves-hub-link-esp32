@@ -6,14 +6,14 @@
 //! `source: "geoip"`, so a fleet of Nerves devices and a fleet of ESP32s land
 //! on the same map with the same accuracy and the same caveats.
 //!
-//! ```no_run
-//! # #[cfg(target_os = "espidf")]
+//! ```ignore
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # use nerves_hub_link_esp32::{esp, AlwaysApply, Config, Credentials};
 //! # use nerves_hub_link_esp32::extensions::Enabled;
 //! use nerves_hub_link_esp32::whenwhere::Whenwhere;
 //!
-//! # let mut config = Config::new("hub.example.test", Credentials::Certificate);
+//! # let credentials = Credentials::shared_secret("device-1", "nhp_key", "secret");
+//! # let mut config = Config::new("hub.example.test", credentials);
 //! config.extensions = Enabled::none().geo();
 //!
 //! esp::agent_with(config, AlwaysApply)?

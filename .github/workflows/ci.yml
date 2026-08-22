@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The protocol, install, extensions and logging layers, on the host. No ESP
+  # toolchain and no ESP-IDF, so this is the fast feedback and covers the code
+  # most likely to be wrong: frames, sequencing, install decisions.
+  test:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # Doc examples are compiled separately from --all-targets, and the README
+      # examples live in doc comments.
+      - name: Test docs
+        run: cargo test --doc
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Everything behind `cfg(target_os = "espidf")` -- the transport, the OTA and
+  # delta writer, HTTP, health, the whenwhere lookup -- is compiled out of the
+  # host build entirely, so without this job none of it is checked at all.
+  #
+  # A type-check rather than a build: linking needs `ldproxy` and gains little,
+  # and the failures worth catching here are missing symbols and changed
+  # signatures in esp-idf-sys, which `check` finds.
+  device:
+    name: Device type-check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: esp32
+            alias: check-esp32
+          - target: esp32s3
+            alias: check-esp32s3
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Xtensa parts need the `esp` rustc fork; there is no stable target
+      # for them. RISC-V parts would build on stable, and are not covered here.
+      - uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: ${{ matrix.target }}
+          ldproxy: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # esp-idf-sys downloads and builds ESP-IDF itself, which is most of this
+      # job's time. Keyed on the pinned version and the component locks, so it
+      # only pays that cost when one of them moves.
+      - name: Cache ESP-IDF
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.espressif
+            .embuild
+          key: esp-idf-${{ matrix.target }}-${{ hashFiles('.cargo/config.toml', 'components_*.lock', 'Cargo.toml') }}
+          restore-keys: esp-idf-${{ matrix.target }}-
+
+      - name: Type-check the crate and the examples
+        run: cargo ${{ matrix.alias }} --all-targets
