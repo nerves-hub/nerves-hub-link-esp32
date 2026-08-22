@@ -55,3 +55,10 @@ opt-level = "z"
 # own Cargo.toml — it is not inherited.
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/esp_websocket_client", version = "^1.0" }
+
+# Applies the detools patches NervesHub generates for ESP-IDF firmware. Same
+# caveat as above: a consumer crate has to declare this itself, because
+# esp-idf-sys only reads the metadata from the root crate.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_delta_ota", version = "^1.1" }
+bindings_header = "include/delta_ota_bindings.h"
