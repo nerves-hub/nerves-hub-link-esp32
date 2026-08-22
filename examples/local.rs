@@ -19,6 +19,7 @@ mod config {
 #[cfg(target_os = "espidf")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use esp_idf_svc::eventloop::EspSystemEventLoop;
+    use esp_idf_svc::hal::gpio::PinDriver;
     use esp_idf_svc::hal::peripherals::Peripherals;
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
     use esp_idf_svc::sntp::{EspSntp, SyncStatus};
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use nerves_hub_link_esp32::extensions::Enabled;
     use nerves_hub_link_esp32::health::EspHealth;
+    use nerves_hub_link_esp32::whenwhere::Whenwhere;
     use nerves_hub_link_esp32::{esp, AlwaysApply, Config, Credentials};
 
     esp_idf_svc::sys::link_patches();
@@ -78,16 +80,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nh.port = config::NH_PORT;
     nh.use_tls = config::NH_USE_TLS;
 
-    // Offered, not assumed: the platform attaches this only if the product has
-    // the health extension enabled.
-    nh.extensions = Enabled::none().health();
+    // Offered, not assumed: the platform attaches these only if the product has
+    // them enabled.
+    nh.extensions = Enabled::none().health().geo();
 
     if !nh.use_tls {
         log::warn!("connecting over plain ws:// — bench use only");
     }
 
+    // Most ESP32 devkits put an LED on GPIO2. On a board that does not, the pin
+    // toggles harmlessly and the log line below is what you watch for.
+    let mut led = PinDriver::output(peripherals.pins.gpio2)?;
+
     log::info!("connecting to {}", nh.socket_url());
-    esp::agent_with(nh, AlwaysApply)?.with_health(EspHealth::new()).run()?;
+
+    esp::agent_with(nh, AlwaysApply)?
+        .with_health(EspHealth::new())
+        .with_location(Whenwhere::new())
+        .on_identify(move || {
+            log::warn!("=== IDENTIFY: this is the device you are looking at ===");
+            for _ in 0..10 {
+                let _ = led.toggle();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            let _ = led.set_low();
+        })
+        .run()?;
 
     Ok(())
 }
