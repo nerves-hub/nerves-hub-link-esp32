@@ -17,8 +17,11 @@ ESP_IDF_VERSION = "v5.2.3"
 # the espidf targets). That flag cannot go in [unstable] — it would apply to
 # host builds too and break `cargo test` on stable — so it lives in aliases.
 #
+#   cargo +esp esp32          type-check and build for the original ESP32
 #   cargo +esp esp32s3        type-check and build for ESP32-S3
-#   cargo +esp check-esp32s3  faster, no linking
+#   cargo +esp check-esp32    faster, no linking
 [alias]
+esp32 = "build --target xtensa-esp32-espidf -Zbuild-std=std,panic_abort"
+check-esp32 = "check --target xtensa-esp32-espidf -Zbuild-std=std,panic_abort"
 esp32s3 = "build --target xtensa-esp32s3-espidf -Zbuild-std=std,panic_abort"
 check-esp32s3 = "check --target xtensa-esp32s3-espidf -Zbuild-std=std,panic_abort"

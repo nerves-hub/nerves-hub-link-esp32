@@ -42,6 +42,7 @@
 //! - The join payload sends `esp_idf_*` keys and **no UUID** — NervesHub derives
 //!   the UUID from `app_elf_sha256`. See [`metadata`].
 
+pub mod shared_secret;
 pub mod agent;
 pub mod checksum;
 pub mod config;

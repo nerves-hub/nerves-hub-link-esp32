@@ -44,17 +44,40 @@ impl WebSocketTransport {
     pub fn connect(config: &Config) -> Result<Self, Error> {
         let (tx, rx): (Sender<String>, Receiver<String>) = channel();
 
-        let Credentials::ClientCertificate {
-            certificate,
-            private_key,
-        } = config.credentials;
+        // Both authentication modes are just configuration on the same client:
+        // a certificate mbedTLS presents during the handshake, or headers sent
+        // with the HTTP upgrade. Which an organization uses is its choice.
+        let (client_cert, client_key, headers) = match &config.credentials {
+            Credentials::ClientCertificate {
+                certificate,
+                private_key,
+            } => (
+                // Presented to NervesHub, which resolves it to a device via
+                // NervesHub.Devices.Certificates.get_device_by_x509/1.
+                Some(X509::pem(certificate)),
+                Some(X509::pem(private_key)),
+                None,
+            ),
+            Credentials::SharedSecret { identifier, secret } => {
+                // The signature is only valid for a short window — 90 seconds by
+                // default — so a device whose clock is wrong fails to join in a
+                // way that looks like a bad secret. Run SNTP before connecting.
+                let signed_at = crate::shared_secret::now_secs();
+                let block = secret
+                    .headers(identifier, signed_at)
+                    .into_iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>();
+
+                (None, None, Some(block))
+            }
+        };
 
         let ws_config = EspWebSocketClientConfig {
-            // Presented to NervesHub, which resolves it to a device via
-            // NervesHub.Devices.Certificates.get_device_by_x509/1.
-            client_cert: Some(X509::pem(certificate)),
-            client_key: Some(X509::pem(private_key)),
+            client_cert,
+            client_key,
             server_cert: config.server_ca.map(X509::pem),
+            headers: headers.as_deref(),
 
             // Phoenix has its own heartbeat on the "phoenix" topic; this is the
             // transport-level one. Both are wanted — the transport ping detects

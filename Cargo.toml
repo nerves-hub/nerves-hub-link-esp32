@@ -15,6 +15,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 
+# Shared-secret authentication. Pure Rust rather than mbedTLS so the token
+# construction is testable on the host against known-good vectors.
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+
 # Only esp-idf-svc is taken directly: it re-exports `sys`, `hal` and `io`, so
 # using those through it keeps the whole esp-rs stack on one consistent version
 # instead of three that have to be kept in step by hand.
