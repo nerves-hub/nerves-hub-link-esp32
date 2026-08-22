@@ -443,6 +443,22 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 link.send_status(transport, "completed", serde_json::json!({}))?;
 
                 link.send_rebooting(transport)?;
+
+                // A send returns once the bytes reach the socket, not once they
+                // reach the server, and `restart` is an immediate reset -- so
+                // the last three messages of an update were being written into
+                // a buffer that a reboot threw away. NervesHub saw the update
+                // stop at whatever progress it had last heard, and inferred
+                // completion from the device rejoining with a new UUID.
+                //
+                // A quarter second is not a guarantee of delivery, and nothing
+                // here can be: the update is already applied, the device is
+                // going to reboot either way, and none of these messages is
+                // worth delaying that for long. It is enough for a LAN and
+                // costs nothing that matters.
+                log::info!("update applied; rebooting");
+                self.platform.sleep(Duration::from_millis(250));
+
                 self.platform.restart();
                 Ok(true)
             }
