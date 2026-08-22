@@ -407,8 +407,16 @@ nothing: the agent answers it and restarts.
   interrupted transfer can be resumed and verified chunk-wise. This restarts
   from zero instead.
 - **Updating the VM or bootloader.** Application partition only.
-- **Console and support scripts.** Handled on the `device` channel by
-  NervesHub, not by this agent.
+- **The console.** NervesHub carries a remote terminal on a third channel of
+  the device socket, `console`, alongside `device` and `extensions`: the device
+  sends output as `up`, receives keystrokes as `dn`, and the server keeps a
+  thousand lines of scrollback so someone attaching sees recent history. On
+  Nerves, `nerves_hub_link` wires that to an IEx session. There is no equivalent
+  session on an ESP32 to attach — the channel is a pipe, and what goes in it is
+  the agent's to decide.
+- **Support scripts** (`scripts/run` on the `device` channel), which ask a
+  device to run something and report what it printed. Same shape of problem as
+  the console.
 - **Local shell and network identity extensions.** Health, geo and logging are
   implemented; these two are not.
 
