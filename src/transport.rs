@@ -21,7 +21,7 @@
 #![cfg(target_os = "espidf")]
 
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use esp_idf_svc::io::EspIOError;
 use esp_idf_svc::tls::X509;
@@ -95,6 +95,22 @@ impl WebSocketTransport {
                 handle_event(&tx, event);
             })
             .map_err(|e: EspIOError| Error::Transport(e.to_string()))?;
+
+        // The IDF client performs the handshake on its own task, so getting a
+        // client back says nothing about the socket being up. The run loop
+        // sends the join as soon as this returns, and sending before the
+        // handshake completes is not a recoverable error in esp-idf-svc — it
+        // panics. So this does not return until there is a connection, and a
+        // handshake that never completes becomes a retryable error.
+        let deadline = Instant::now() + timeout;
+        while !client.is_connected() {
+            if Instant::now() >= deadline {
+                return Err(Error::Transport(
+                    "timed out waiting for the WebSocket handshake".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         Ok(Self {
             client,

@@ -1,0 +1,17 @@
+# Used only for building the examples in this repo, which are applications
+# rather than library consumers. An absolute path because esp-idf-sys builds
+# ESP-IDF in its own output directory, where a relative one does not resolve.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/Users/joshkalderimis/Development/nerves/nerves-hub-link-esp32/partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# The OTA layout above needs 4MB; the build otherwise assumes 2MB and the
+# partition table is rejected as too large.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# The version NervesHub records for this bench image. Without it ESP-IDF uses
+# `git describe`, which is not SemVer and leaves the device with no firmware
+# metadata server-side.
+CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
+CONFIG_APP_PROJECT_VER="1.0.0"

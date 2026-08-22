@@ -1,0 +1,35 @@
+// Copy this file to `local_config.rs` and fill it in. It is gitignored.
+//
+// The shared secret comes from your NervesHub instance. For a local dev server:
+//
+//   mix run -e 'alias NervesHub.{Products, Repo}
+//     org = Repo.get_by!(NervesHub.Accounts.Org, name: "NervesTeam")
+//     p = Repo.get_by!(Products.Product, org_id: org.id, name: "SmartKiosk")
+//     [a | _] = Products.load_shared_secret_auth(p).shared_secret_auths
+//     IO.puts("key:    #{a.key}\nsecret: #{a.secret}")'
+
+pub const WIFI_SSID: &str = "my-network";
+pub const WIFI_PASSWORD: &str = "my-password";
+
+/// Where NervesHub is. For a dev server this is your machine's LAN address —
+/// not localhost, which on the device means the device.
+pub const NH_HOST: &str = "192.168.1.137";
+
+/// 4000 for a local dev server's web endpoint, which also mounts the device
+/// socket. 443 for a real deployment.
+pub const NH_PORT: u16 = 4000;
+
+/// Plain `ws://` for a local bench. Never for anything reachable from a network
+/// you do not control: the authentication headers go out in clear, and anything
+/// on the path can impersonate the server to a device that takes firmware from
+/// it.
+pub const NH_USE_TLS: bool = false;
+
+/// A product secret (`nhp_…`) registers unknown devices on first connection.
+/// A device secret (`nhd_…`) is tied to one device that already exists.
+pub const NH_SHARED_SECRET_KEY: &str = "nhp_...";
+pub const NH_SHARED_SECRET: &str = "...";
+
+/// What this device calls itself. Any stable string; the MAC address is a
+/// reasonable default if you have nothing better.
+pub const DEVICE_IDENTIFIER: &str = "esp32-bench-1";

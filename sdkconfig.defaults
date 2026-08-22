@@ -19,6 +19,18 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # the picture.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=10000
 
-# Set this to the semantic version NervesHub should record. It is read from
-# esp_app_desc_t.version at upload time and must parse as SemVer.
-# (Prefer setting PROJECT_VER in CMakeLists.txt.)
+# Your *application* must set the version NervesHub records. It is read from
+# esp_app_desc_t.version, both at upload and from the running image, and must
+# parse as SemVer. Left unset, ESP-IDF fills it from `git describe`, which does
+# not — and a device reporting an unparseable version has no firmware metadata
+# server-side, so it can never be matched to a deployment while looking
+# perfectly healthy.
+#
+#   CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
+#   CONFIG_APP_PROJECT_VER="1.0.0"
+#
+# Not set here: the version belongs to the application, not to this library.
+#
+# The project name has no equivalent setting — esp-idf-sys hardcodes the CMake
+# project name to `libespidf`, and NervesHub matches that field against the
+# product. See scripts/set_app_desc.py.

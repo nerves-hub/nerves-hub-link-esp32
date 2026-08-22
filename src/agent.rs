@@ -172,10 +172,18 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         }
     }
 
-    /// Tell NervesHub the running image is good, and cancel the rollback.
+    /// Tell NervesHub the running image is good, and cancel any rollback.
     ///
     /// Only reached once the join succeeded, which is the whole point: "we can
     /// talk to NervesHub" is the definition of a working image.
+    ///
+    /// The rollback and the report are separate, and only one is conditional.
+    /// Cancelling a rollback applies to an image the bootloader still has on
+    /// probation — one installed by OTA — so it is skipped when nothing is
+    /// pending. Reporting applies either way: an image flashed over a cable is
+    /// never pending, but it is the image meant to be running and has just
+    /// proved it works, and a device that stays silent is indistinguishable on
+    /// the server from one that has never reported its firmware at all.
     fn confirm_running_image(
         &mut self,
         link: &mut Link,
@@ -183,8 +191,9 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     ) -> Result<(), Error> {
         if self.platform.pending_verify() == PendingVerify::Yes {
             self.platform.mark_valid()?;
-            link.send_firmware_validated(transport)?;
         }
+
+        link.send_firmware_validated(transport)?;
 
         Ok(())
     }
@@ -476,10 +485,13 @@ mod tests {
         let _ = agent.session(&mut transport);
 
         assert_eq!(shared.borrow().marked_valid, 0);
+        assert!(!events(&shared).contains(&"firmware_validated".to_string()));
     }
 
+    // A serially flashed image is never pending, so there is no rollback to
+    // cancel — but it is running, and it has just joined.
     #[test]
-    fn an_image_that_is_not_pending_is_not_confirmed() {
+    fn an_image_that_is_not_pending_is_reported_but_not_marked() {
         let plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
         let shared = Rc::clone(&plat.shared);
 
@@ -488,7 +500,7 @@ mod tests {
         let _ = agent.session(&mut transport);
 
         assert_eq!(shared.borrow().marked_valid, 0);
-        assert!(!events(&shared).contains(&"firmware_validated".to_string()));
+        assert!(events(&shared).contains(&"firmware_validated".to_string()));
     }
 
     #[test]

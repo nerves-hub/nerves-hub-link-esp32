@@ -3,3 +3,6 @@ Cargo.lock
 .embuild
 .embuild/
 /components_esp32s3.lock
+
+# Bench configuration: WiFi and NervesHub secrets.
+/local_config.rs
