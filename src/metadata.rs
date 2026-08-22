@@ -36,6 +36,27 @@ pub struct FirmwareMetadata {
     pub chip_id: u16,
 }
 
+/// The part name for an `esp_image_header_t.chip_id`.
+///
+/// Same table NervesHub keys its platform and architecture off, so a device and
+/// the server agree on what to call the thing. Note that a plain ESP32 is
+/// `0x0000`: an id of zero is a real answer rather than a missing one, which is
+/// worth knowing before treating it as unset.
+pub fn chip_name(chip_id: u16) -> Option<&'static str> {
+    match chip_id {
+        0x0000 => Some("esp32"),
+        0x0002 => Some("esp32s2"),
+        0x0005 => Some("esp32c3"),
+        0x0009 => Some("esp32s3"),
+        0x000C => Some("esp32c2"),
+        0x000D => Some("esp32c6"),
+        0x0010 => Some("esp32h2"),
+        0x0012 => Some("esp32p4"),
+        0x0017 => Some("esp32c5"),
+        _ => None,
+    }
+}
+
 impl FirmwareMetadata {
     /// The `phx_join` payload.
     ///
@@ -214,6 +235,20 @@ mod tests {
     // NervesHub reads both of these from the join, under "meta". A device that
     // reverted may never send anything after the join, so the join is the only
     // place the fact reliably fits.
+    // A plain ESP32 is id zero, so "no chip id" and "the most common chip" look
+    // identical to anything treating zero as absent.
+    #[test]
+    fn chip_zero_is_a_real_part_and_not_a_missing_one() {
+        assert_eq!(chip_name(0x0000), Some("esp32"));
+    }
+
+    #[test]
+    fn the_chips_this_crate_is_built_for_are_named() {
+        assert_eq!(chip_name(0x0009), Some("esp32s3"));
+        assert_eq!(chip_name(0x000D), Some("esp32c6"));
+        assert_eq!(chip_name(0xBEEF), None);
+    }
+
     #[test]
     fn the_join_carries_what_the_device_knows_about_its_own_boot() {
         let boot = BootReport {

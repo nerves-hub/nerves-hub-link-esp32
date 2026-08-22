@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::error::Error;
 use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
+use crate::message::{CONSOLE_TOPIC, CONSOLE_VERSION};
 use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::metadata::{BootReport, FirmwareMetadata};
 use crate::update::{Stage, UpdateDecision, UpdatePayload};
@@ -48,6 +49,11 @@ pub enum Action {
     Reboot,
     /// An operator pressed Identify. Blink something.
     Identify,
+    /// Someone typed at the console. The caller runs the commands and answers
+    /// with [`Link::send_console`].
+    Console(String),
+    /// The console session was restarted; discard any part-typed line.
+    ConsoleRestart,
     /// The server closed or errored the channel; reconnect.
     Reconnect,
 }
@@ -59,6 +65,8 @@ pub struct Link {
     join_ref: Option<String>,
     extensions: Extensions,
     extensions_join_ref: Option<String>,
+    console_join_ref: Option<String>,
+    console_wanted: bool,
     joined: bool,
     downloading: Option<String>,
 }
@@ -74,6 +82,8 @@ impl Link {
             join_ref: None,
             extensions: Extensions::new(enabled),
             extensions_join_ref: None,
+            console_join_ref: None,
+            console_wanted: false,
             joined: false,
             downloading: None,
         }
@@ -201,6 +211,10 @@ impl Link {
             return self.handle_extension_frame(transport, &message);
         }
 
+        if message.topic == CONSOLE_TOPIC {
+            return self.handle_console_frame(transport, &message);
+        }
+
         match message.event.as_str() {
             event::REPLY => self.handle_reply(transport, handler, &message),
             event::UPDATE => {
@@ -214,6 +228,101 @@ impl Link {
                 self.extensions.disconnected();
                 Ok(Action::Reconnect)
             }
+            _ => Ok(Action::None),
+        }
+    }
+
+    /// Ask for the terminal. Off unless the application called
+    /// `Agent::with_console`, because it is a remote command surface.
+    pub fn want_console(&mut self) {
+        self.console_wanted = true;
+    }
+
+    pub fn console_wanted(&self) -> bool {
+        self.console_wanted
+    }
+
+    pub fn console_joined(&self) -> bool {
+        self.console_join_ref.is_some()
+    }
+
+    /// Join the terminal channel.
+    pub fn send_console_join<T: Transport>(&mut self, transport: &mut T) -> Result<(), Error> {
+        let reference = self.refs.next_ref();
+        self.console_join_ref = Some(reference.clone());
+
+        // Not `send`, which stamps the *device* channel's join_ref on whatever
+        // it is given. A join carries its own ref in both positions, and that
+        // ref is what every later frame on the topic is labelled with.
+        let frame = Message::new(
+            CONSOLE_TOPIC,
+            event::JOIN,
+            json!({"console_version": CONSOLE_VERSION}),
+        )
+        .with_refs(Some(reference.clone()), Some(reference))
+        .encode()?;
+
+        transport.send(&frame)
+    }
+
+    /// Write to the terminal.
+    ///
+    /// A terminal expects `\r\n`, not `\n`: without the carriage return each
+    /// line starts where the last one ended and the output walks off to the
+    /// right.
+    pub fn send_console<T: Transport>(&mut self, transport: &mut T, text: &str) -> Result<(), Error> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let reference = self.refs.next_ref();
+
+        let message = Message::new(CONSOLE_TOPIC, event::UP, json!({"data": text}))
+            .with_refs(self.console_join_ref.clone(), Some(reference));
+
+        transport.send(&message.encode()?)
+    }
+
+    fn handle_console_frame<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        message: &Message,
+    ) -> Result<Action, Error> {
+        match message.event.as_str() {
+            // The join being accepted is the first and only chance to put
+            // something in the scrollback before anyone attaches. Without it,
+            // opening the terminal on a device nobody has typed at yet shows an
+            // empty screen, which reads as a device that is not answering
+            // rather than one waiting to be asked.
+            event::REPLY => {
+                let is_join_reply = self.console_join_ref.as_deref() == message.reference.as_deref();
+
+                if is_join_reply {
+                    self.send_console(transport, crate::console::PROMPT)?;
+                }
+
+                Ok(Action::None)
+            }
+
+            event::DOWN => match message.payload.get("data").and_then(|d| d.as_str()) {
+                Some(data) => Ok(Action::Console(data.to_string())),
+                None => Ok(Action::None),
+            },
+
+            event::RESTART => Ok(Action::ConsoleRestart),
+
+            // Declined rather than ignored. The upload is part of the channel
+            // and has no use here, and a UI waiting for an acknowledgement it
+            // will never get looks like a device that has stopped answering.
+            event::FILE_DATA_START | event::FILE_DATA | event::FILE_DATA_STOP => {
+                self.send_console(
+                    transport,
+                    "\r\nfile transfer is not supported on this device\r\n",
+                )?;
+
+                Ok(Action::None)
+            }
+
             _ => Ok(Action::None),
         }
     }
@@ -563,6 +672,50 @@ mod tests {
             }
             other => panic!("expected an update, got {other:?}"),
         }
+    }
+
+    // Someone opening the terminal on a device nobody has typed at yet sees
+    // whatever the server has buffered, which is nothing. A prompt written when
+    // the channel opens is the difference between "waiting for you" and "not
+    // answering".
+    #[test]
+    fn a_prompt_is_written_as_soon_as_the_console_opens() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_join(&mut transport, BootReport::default()).unwrap();
+        link.send_console_join(&mut transport).unwrap();
+
+        let join_ref = transport.last().reference.unwrap();
+
+        let frame = format!(
+            r#"["{join_ref}","{join_ref}","console","phx_reply",{{"status":"ok","response":{{}}}}]"#
+        );
+
+        link.handle_frame(&mut transport, &mut AlwaysApply, &frame)
+            .unwrap();
+
+        let sent = transport.last();
+
+        assert_eq!(sent.event, "up");
+        assert_eq!(sent.payload["data"], json!(crate::console::PROMPT));
+    }
+
+    // Phoenix labels every frame on a topic with the ref of the join that
+    // opened it, and a join carries its own ref in both positions. Stamping
+    // the device channel's join_ref on a console join instead is silent: the
+    // frame is well formed, the server does not answer, and the terminal looks
+    // like a device that is simply not listening.
+    #[test]
+    fn a_console_join_carries_its_own_ref_in_both_positions() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_join(&mut transport, BootReport::default()).unwrap();
+        link.send_console_join(&mut transport).unwrap();
+
+        let sent = transport.last();
+
+        assert_eq!(sent.topic, "console");
+        assert_eq!(sent.event, "phx_join");
+        assert_eq!(sent.join_ref, sent.reference);
+        assert!(sent.join_ref.is_some());
     }
 
     // The two commands NervesHub pushes at a device. `reconnect` is absent on

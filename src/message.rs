@@ -28,6 +28,15 @@ use serde_json::Value;
 /// unqualified.
 pub const DEVICE_TOPIC: &str = "device";
 
+/// The terminal topic, joined separately and only when asked for.
+///
+/// Unqualified like `device`, and rewritten server-side the same way.
+pub const CONSOLE_TOPIC: &str = "console";
+
+/// Sent on joining `console`. NervesHub records it against the session and
+/// hands it to whoever attaches.
+pub const CONSOLE_VERSION: &str = "1.0.0";
+
 /// Phoenix's own topic, used for heartbeats.
 pub const CONTROL_TOPIC: &str = "phoenix";
 
@@ -69,6 +78,21 @@ pub mod event {
     /// Identify, so that someone standing in front of a shelf of identical
     /// boxes can tell which one they are looking at.
     pub const IDENTIFY: &str = "identify";
+
+    /// Device -> server: console output.
+    pub const UP: &str = "up";
+
+    /// Server -> device: console input, a keystroke or a whole line.
+    pub const DOWN: &str = "dn";
+
+    /// Server -> device: start the console session over. On Nerves this
+    /// restarts IEx; here there is only a part-typed line to discard.
+    pub const RESTART: &str = "restart";
+
+    /// Server -> device: a file, in three parts. Declined -- see `console`.
+    pub const FILE_DATA_START: &str = "file-data/start";
+    pub const FILE_DATA: &str = "file-data";
+    pub const FILE_DATA_STOP: &str = "file-data/stop";
 
     // There is no `reconnect` constant, and that is not an omission.
     // NervesHub's third device command is served by closing the socket rather

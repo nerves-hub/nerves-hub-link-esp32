@@ -102,15 +102,46 @@ pub struct LogBuffer {
     lines: Mutex<VecDeque<LogLine>>,
     capacity: usize,
     dropped: AtomicUsize,
+    /// The lowest level forwarded to NervesHub, as `log::Level as usize`.
+    ///
+    /// Shared rather than fixed at install so it can be raised for a few
+    /// minutes and lowered again. Debug logging is unaffordable across a fleet
+    /// and free on one device while someone watches it.
+    threshold: AtomicUsize,
 }
 
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
+        Self::with_threshold(capacity, log::Level::Info)
+    }
+
+    pub fn with_threshold(capacity: usize, threshold: log::Level) -> Self {
         Self {
             lines: Mutex::new(VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY))),
             capacity,
             dropped: AtomicUsize::new(0),
+            threshold: AtomicUsize::new(threshold as usize),
         }
+    }
+
+    /// The lowest level currently forwarded to NervesHub.
+    pub fn level(&self) -> log::Level {
+        match self.threshold.load(Ordering::Relaxed) {
+            n if n == log::Level::Error as usize => log::Level::Error,
+            n if n == log::Level::Warn as usize => log::Level::Warn,
+            n if n == log::Level::Info as usize => log::Level::Info,
+            n if n == log::Level::Debug as usize => log::Level::Debug,
+            _ => log::Level::Trace,
+        }
+    }
+
+    /// Change what is forwarded, from now on.
+    ///
+    /// Only affects what is kept for NervesHub. The console keeps whatever
+    /// `install` set as the maximum, so raising this past that maximum reports
+    /// nothing new -- there is nothing there to forward.
+    pub fn set_level(&self, level: log::Level) {
+        self.threshold.store(level as usize, Ordering::Relaxed);
     }
 
     /// Queue a line, or count it as lost.
@@ -186,7 +217,6 @@ impl LogBuffer {
 struct Capture {
     inner: esp_idf_svc::log::EspIdfLogger,
     buffer: Arc<LogBuffer>,
-    send_from: log::Level,
 }
 
 #[cfg(target_os = "espidf")]
@@ -200,7 +230,7 @@ impl log::Log for Capture {
         // should see exactly what they saw before this was installed.
         self.inner.log(record);
 
-        if record.level() > self.send_from {
+        if record.level() > self.buffer.level() {
             return;
         }
 
@@ -242,12 +272,11 @@ pub fn install_with_capacity(
     send_from: log::Level,
     capacity: usize,
 ) -> Arc<LogBuffer> {
-    let buffer = Arc::new(LogBuffer::new(capacity));
+    let buffer = Arc::new(LogBuffer::with_threshold(capacity, send_from));
 
     let capture = Capture {
         inner: esp_idf_svc::log::EspIdfLogger::new(()),
         buffer: Arc::clone(&buffer),
-        send_from,
     };
 
     // A second call would fail, and an application that already installed a

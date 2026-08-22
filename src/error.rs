@@ -20,6 +20,19 @@ pub enum Error {
     Ota(String),
     /// The downloaded image did not match the checksum NervesHub advertised.
     ChecksumMismatch { expected: String, actual: String },
+    /// A console command failed. Printed at the terminal that asked.
+    Console(String),
+}
+
+/// So a command can write with `write!` and `?` like anywhere else.
+///
+/// Writing to a console `Output` cannot actually fail -- it is bounded and
+/// drops the overflow -- but `write!` returns a `Result` and a command author
+/// should not have to care which kind.
+impl From<core::fmt::Error> for Error {
+    fn from(_: core::fmt::Error) -> Self {
+        Error::Console("could not format output".into())
+    }
 }
 
 impl fmt::Display for Error {
@@ -35,6 +48,7 @@ impl fmt::Display for Error {
             Error::ChecksumMismatch { expected, actual } => {
                 write!(f, "checksum mismatch: expected {expected}, got {actual}")
             }
+            Error::Console(msg) => write!(f, "{msg}"),
         }
     }
 }

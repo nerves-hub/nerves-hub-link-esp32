@@ -46,6 +46,7 @@ pub mod shared_secret;
 pub mod agent;
 pub mod checksum;
 pub mod config;
+pub mod console;
 pub mod error;
 pub mod extensions;
 pub mod health;

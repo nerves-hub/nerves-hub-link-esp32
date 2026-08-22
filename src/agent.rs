@@ -12,6 +12,7 @@
 //! While that logic lived in an example, every user copied it and no test
 //! covered it. Here it is library code with a fake [`Platform`] behind it.
 
+use core::fmt::Write;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use crate::config::Config;
 use crate::extensions::{HealthProvider, LocationProvider, Outgoing};
 use crate::error::Error;
 use crate::install::{install, HttpStream, ImageSink};
+use crate::console::{self, LineReader, Output};
 use crate::link::{Action, Link, Transport, UpdateHandler};
 use crate::logging::LogBuffer;
 use crate::metadata::{BootReport, FirmwareMetadata};
@@ -98,6 +100,75 @@ pub struct Agent<P, H> {
     health: Option<Box<dyn HealthProvider>>,
     identify: Option<Box<dyn FnMut()>>,
     logs: Option<Arc<LogBuffer>>,
+    console: Option<Console>,
+}
+
+/// What a command does when someone types its name.
+///
+/// A closure rather than a trait: a command set is a handful of functions, and
+/// the registry is the only thing that needs to hold them together.
+pub type CommandFn = Box<dyn FnMut(&[&str], &mut Output) -> Result<(), Error>>;
+
+/// The terminal, and the commands reachable from it.
+#[derive(Default)]
+struct Console {
+    reader: LineReader,
+    commands: Vec<(String, String, CommandFn)>,
+}
+
+impl Console {
+    /// Run one line, and return what to print.
+    ///
+    /// An unknown command says so and points at `help`, because silence is
+    /// indistinguishable from a device that has stopped answering.
+    ///
+    /// `help`, `reboot` and `log` never reach here: they need the agent's own
+    /// platform, restart and log buffer, so the caller handles them and this
+    /// only sees what the registry can answer.
+    fn run(&mut self, line: &str) -> String {
+        let Some((name, args)) = console::parse(line) else {
+            return String::new();
+        };
+
+        let mut out = Output::new();
+
+        if name == "help" {
+            let mut names: Vec<&(String, String, CommandFn)> = self.commands.iter().collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let _ = writeln!(out, "commands:\r");
+
+            // Handled by the agent rather than the registry, so they are not
+            // in the list below and have to be named here.
+            for (name, help) in [
+                ("help", "this list"),
+                ("log [level]", "what is sent to NervesHub"),
+                ("reboot", "restart the device"),
+            ] {
+                let _ = writeln!(out, "  {name:<14} {help}\r");
+            }
+
+            for (name, help, _) in names {
+                let _ = writeln!(out, "  {name:<14} {help}\r");
+            }
+
+            return out.finish();
+        }
+
+        match self.commands.iter_mut().find(|(n, _, _)| n == name) {
+            Some((_, _, run)) => {
+                if let Err(err) = run(&args, &mut out) {
+                    let _ = write!(out, "\r\n{name}: {err}");
+                }
+            }
+
+            None => {
+                let _ = write!(out, "{name}: unknown command, try `help`");
+            }
+        }
+
+        out.finish()
+    }
 }
 
 impl<P: Platform, H: UpdateHandler> Agent<P, H> {
@@ -107,6 +178,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             health: None,
             identify: None,
             logs: None,
+            console: None,
             config,
             metadata,
             platform,
@@ -124,6 +196,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             health: self.health,
             identify: self.identify,
             logs: self.logs,
+            console: self.console,
             handler,
         }
     }
@@ -155,6 +228,100 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         self
     }
 
+    /// Offer NervesHub a terminal, with a fixed set of commands behind it.
+    ///
+    /// Off unless asked for: it is a remote command surface, and a device that
+    /// never calls this never joins the channel. See [`crate::console`] for
+    /// what it is and, more importantly, what it is not.
+    ///
+    /// Brings `help`, `info`, `uptime` and `reboot` with it. The device build
+    /// adds the ones that need ESP-IDF -- `heap`, `wifi`, `partitions`,
+    /// `reset-reason` and `log`.
+    pub fn with_console(mut self) -> Self {
+        if self.console.is_none() {
+            self.console = Some(Console::default());
+        }
+
+        let metadata = self.metadata.clone();
+
+        let started = std::time::Instant::now();
+
+        self.command("uptime", "time since boot", move |_args, out| {
+            let seconds = started.elapsed().as_secs();
+
+            write!(
+                out,
+                "{}d {:02}h {:02}m {:02}s",
+                seconds / 86_400,
+                (seconds % 86_400) / 3600,
+                (seconds % 3600) / 60,
+                seconds % 60
+            )?;
+
+            Ok(())
+        })
+        .device_commands()
+        .command("info", "firmware and device identity", move |_args, out| {
+            writeln!(out, "project   {}\r", metadata.project_name)?;
+            writeln!(out, "version   {}\r", metadata.version)?;
+            writeln!(out, "idf       {}\r", metadata.idf_ver)?;
+            match crate::metadata::chip_name(metadata.chip_id) {
+                Some(name) => writeln!(out, "chip      {name}\r")?,
+                // Unknown rather than absent: a chip this build has never heard
+                // of still has an id worth reporting.
+                None => writeln!(out, "chip      unknown ({:#06x})\r", metadata.chip_id)?,
+            }
+            write!(out, "elf sha   {}", &metadata.app_elf_sha256[..16])?;
+            Ok(())
+        })
+    }
+
+    /// The commands that need ESP-IDF. Nothing on the host.
+    #[cfg(target_os = "espidf")]
+    fn device_commands(self) -> Self {
+        self.command("heap", "memory, and how fragmented it is", |_args, out| {
+            console::device::heap(out)
+        })
+        .command("wifi", "ssid, signal and address", |_args, out| {
+            console::device::wifi(out)
+        })
+        .command("partitions", "which slot runs, and the other's state", |_args, out| {
+            console::device::partitions(out)
+        })
+        .command("reset-reason", "why it last rebooted", |_args, out| {
+            console::device::reset_reason(out)
+        })
+    }
+
+    #[cfg(not(target_os = "espidf"))]
+    fn device_commands(self) -> Self {
+        self
+    }
+
+    /// Add a command, or replace one of the built-ins.
+    ///
+    /// Ignored unless [`Agent::with_console`] was called, so an application can
+    /// register commands unconditionally and decide elsewhere whether the
+    /// terminal is offered at all.
+    pub fn command(
+        mut self,
+        name: &str,
+        help: &str,
+        run: impl FnMut(&[&str], &mut Output) -> Result<(), Error> + 'static,
+    ) -> Self {
+        if let Some(console) = self.console.as_mut() {
+            console
+                .commands
+                .retain(|(existing, _, _)| existing != name);
+
+            console
+                .commands
+                .push((name.to_string(), help.to_string(), Box::new(run)));
+        }
+
+        self
+    }
+
     /// Make the device identifiable to someone standing next to it.
     ///
     /// Run when an operator presses Identify in NervesHub, which they press
@@ -172,6 +339,93 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     pub fn on_identify(mut self, identify: impl FnMut() + 'static) -> Self {
         self.identify = Some(Box::new(identify));
         self
+    }
+
+    /// Echo what was typed, run any completed line, and print the prompt.
+    ///
+    /// Commands run here, on the session loop, so a slow one delays heartbeats
+    /// and everything else by however long it takes. The budget is
+    /// milliseconds; anything longer belongs on a task, with the command
+    /// reporting that it started rather than waiting for it to finish.
+    /// `true` when a command asked the device to restart.
+    fn answer_console<T: Transport>(
+        &mut self,
+        link: &mut Link,
+        transport: &mut T,
+        data: &str,
+    ) -> Result<bool, Error> {
+        let (echo, lines) = match self.console.as_mut() {
+            Some(console) => console.reader.feed(data),
+            None => return Ok(false),
+        };
+
+        link.send_console(transport, &echo)?;
+
+        for line in lines {
+            let parsed = console::parse(&line)
+                .map(|(name, args)| (name.to_string(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>()));
+
+            let output = match parsed.as_ref().map(|(name, args)| (name.as_str(), args)) {
+                // Announced before restarting rather than after: the socket is
+                // about to go, and whoever typed it should see that it was
+                // taken rather than watch the terminal die.
+                Some(("reboot", _)) => {
+                    link.send_console(transport, "rebooting\r\n")?;
+                    self.platform.sleep(Duration::from_millis(250));
+                    self.platform.restart();
+
+                    return Ok(true);
+                }
+
+                Some(("log", args)) => self.log_command(args),
+
+                _ => match self.console.as_mut() {
+                    Some(console) => console.run(&line),
+                    None => String::new(),
+                },
+            };
+
+            if !output.is_empty() {
+                link.send_console(transport, &output)?;
+                link.send_console(transport, "\r\n")?;
+            }
+
+            link.send_console(transport, console::PROMPT)?;
+        }
+
+        Ok(false)
+    }
+
+    /// `log` — show or change what is forwarded to NervesHub.
+    ///
+    /// Lives here rather than in the registry because it needs the buffer the
+    /// logger writes into, which the application supplies separately.
+    fn log_command(&mut self, args: &[String]) -> String {
+        let mut out = Output::new();
+
+        let Some(logs) = self.logs.as_ref() else {
+            let _ = write!(out, "log: this device is not sending logs to NervesHub");
+            return out.finish();
+        };
+
+        match args.first().map(|a| a.as_str()) {
+            None => {
+                let _ = write!(out, "log level is {}", logs.level().as_str().to_lowercase());
+            }
+
+            Some(level) => match level.parse::<log::Level>() {
+                Ok(level) => {
+                    logs.set_level(level);
+                    let _ = write!(out, "log level is now {}", level.as_str().to_lowercase());
+                }
+
+                Err(_) => {
+                    let _ = write!(out, "log: unknown level {level:?}, try error/warn/info/debug/trace");
+                }
+            },
+        }
+
+        out.finish()
     }
 
     /// Resolve what the platform asked for, using the application's providers.
@@ -274,6 +528,10 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     ) -> Result<Option<Stopped>, Error> {
         let mut link = Link::new(self.config.clone(), self.metadata.clone());
 
+        if self.console.is_some() {
+            link.want_console();
+        }
+
         // Both facts are read from the join, not from a later message. That is
         // deliberate on the platform's side: a device that reverted may never
         // get far enough to send anything else, and the revert is exactly the
@@ -292,6 +550,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         let mut confirmed = false;
         let mut extensions_joined = false;
         let mut extensions_reported = false;
+        let mut console_joined = false;
         let mut last_log = self.platform.now_ms();
         let mut last_heartbeat = self.platform.now_ms();
         let heartbeat_ms = self.config.heartbeat_interval_secs * 1_000;
@@ -314,6 +573,11 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             // Which extensions the platform actually attached is the answer to
             // most "why is nothing arriving" questions, and the device is the
             // only place both halves are visible.
+            if link.joined() && link.console_wanted() && !console_joined {
+                link.send_console_join(transport)?;
+                console_joined = true;
+            }
+
             if link.extensions_joined() && !extensions_reported {
                 extensions_reported = true;
                 log::info!(
@@ -371,6 +635,19 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                     if let Some(identify) = self.identify.as_mut() {
                         identify();
                     }
+                }
+                Ok(Action::Console(data)) => {
+                    if self.answer_console(&mut link, transport, &data)? {
+                        return Ok(Some(Stopped::Rebooting));
+                    }
+                }
+                Ok(Action::ConsoleRestart) => {
+                    if let Some(console) = self.console.as_mut() {
+                        console.reader = LineReader::new();
+                    }
+
+                    link.send_console(transport, "\r\n")?;
+                    link.send_console(transport, console::PROMPT)?;
                 }
                 Ok(Action::Reconnect) => return Ok(None),
                 Ok(Action::Extension(needs)) => {
@@ -735,6 +1012,216 @@ mod tests {
 
         // Two scripted sessions plus the connect that ends the run.
         assert_eq!(shared.borrow().connects, 3);
+    }
+
+    /// Everything the device wrote to the terminal, joined.
+    fn console_output(shared: &Rc<RefCell<Shared>>) -> String {
+        shared
+            .borrow()
+            .sent
+            .iter()
+            .filter_map(|frame| {
+                let message = Message::decode(frame).ok()?;
+
+                if message.topic != "console" || message.event != "up" {
+                    return None;
+                }
+
+                Some(message.payload["data"].as_str()?.to_string())
+            })
+            .collect()
+    }
+
+    fn typed(text: &str) -> Incoming {
+        Ok(Some(format!(
+            r#"[null,null,"console","dn",{{"data":{}}}]"#,
+            serde_json::to_string(text).unwrap()
+        )))
+    }
+
+    // The terminal is not offered unless the application asked for it: it is a
+    // remote command surface, not a diagnostic that costs nothing.
+    #[test]
+    fn no_console_channel_is_joined_unless_asked_for() {
+        let plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat);
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let joined_console = shared.borrow().sent.iter().any(|frame| {
+            let message = Message::decode(frame).unwrap();
+            message.topic == "console" && message.event == "phx_join"
+        });
+
+        assert!(!joined_console);
+    }
+
+    // The mirror of the test above, and the one that was missing: feeding a
+    // `dn` frame proves dispatch works, but the server only ever sends one to a
+    // device that joined the channel.
+    #[test]
+    fn the_console_channel_is_joined_when_asked_for() {
+        let plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console();
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let joined = shared.borrow().sent.iter().any(|frame| {
+            let message = Message::decode(frame).unwrap();
+            message.topic == "console" && message.event == "phx_join"
+        });
+
+        assert!(joined, "the console channel was never joined");
+    }
+
+    #[test]
+    fn a_command_runs_and_its_output_comes_back() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("ping\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console().command("ping", "say pong", |_args, out| {
+            write!(out, "pong")?;
+            Ok(())
+        });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let output = console_output(&shared);
+
+        assert!(output.contains("pong"), "{output:?}");
+        // Echoed, and followed by a prompt: it should read as a terminal.
+        assert!(output.contains("ping"), "{output:?}");
+        assert!(output.contains(console::PROMPT), "{output:?}");
+    }
+
+    #[test]
+    fn arguments_reach_the_command() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("relay on now\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat)
+            .with_console()
+            .command("relay", "drive it", |args, out| {
+                write!(out, "got {}", args.join("+"))?;
+                Ok(())
+            });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        assert!(console_output(&shared).contains("got on+now"));
+    }
+
+    // Silence is indistinguishable from a device that has stopped answering.
+    #[test]
+    fn an_unknown_command_says_so() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("wat\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console();
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let output = console_output(&shared);
+
+        assert!(output.contains("unknown command"), "{output:?}");
+        assert!(output.contains("help"), "{output:?}");
+    }
+
+    // A command that fails should report why rather than print nothing.
+    #[test]
+    fn a_failing_command_reports_its_error() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("boom\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console().command("boom", "fail", |_args, _out| {
+            Err(Error::Console("the relay is stuck".into()))
+        });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        assert!(console_output(&shared).contains("the relay is stuck"));
+    }
+
+    #[test]
+    fn help_lists_what_can_be_typed() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("help\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat)
+            .with_console()
+            .command("relay", "drive the relay", |_args, out| {
+                write!(out, "ok")?;
+                Ok(())
+            });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let output = console_output(&shared);
+
+        for expected in ["relay", "drive the relay", "info", "uptime", "reboot", "log"] {
+            assert!(output.contains(expected), "{expected} missing from {output:?}");
+        }
+    }
+
+    // The upload half of the channel has no use here, and a UI waiting for an
+    // acknowledgement it will never get looks like a device that has stopped.
+    #[test]
+    fn a_file_transfer_is_declined_rather_than_ignored() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            Ok(Some(
+                r#"[null,null,"console","file-data/start",{"filename":"x"}]"#.to_string(),
+            )),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console();
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        assert!(console_output(&shared).contains("not supported"));
+    }
+
+    #[test]
+    fn reboot_from_the_console_restarts_the_device() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("reboot\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console();
+        let mut transport = agent.platform.connect(&config()).unwrap();
+
+        assert_eq!(
+            agent.session(&mut transport, &mut false).unwrap(),
+            Some(Stopped::Rebooting)
+        );
+        assert_eq!(shared.borrow().restarts, 1);
+        assert!(console_output(&shared).contains("rebooting"));
     }
 
     #[test]

@@ -101,6 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_health(EspHealth::new())
         .with_location(Whenwhere::new())
         .with_logs(logs)
+        .with_console()
+        // An application command, to show what registering one looks like. The
+        // built-ins cover the device; this covers whatever the device is for.
+        .command("echo", "say something back", |args, out| {
+            use std::fmt::Write;
+            write!(out, "{}", args.join(" "))?;
+            Ok(())
+        })
         .on_identify(move || {
             log::warn!("=== IDENTIFY: this is the device you are looking at ===");
             for _ in 0..10 {
