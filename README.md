@@ -11,45 +11,34 @@ bootloader's rollback protection intact.
 
 ## Status
 
-**Early development, use at your own risk**
-
-Run on an ESP32-WROOM-32D against a NervesHub instance: connecting, updating
-over the air, applying deltas, rolling back, and reporting health, position and
-logs. It has not run on anything else, for any length of time, or on a fleet.
+**Early development**
 
 | Layer | State |
 | --- | --- |
-| Phoenix v2 frame codec | Host tested, run on hardware |
-| Join payload / firmware metadata | Host tested, run on hardware |
-| Update payload, decisions, progress throttling | Host tested, run on hardware |
-| Checksums | Host tested, run on hardware |
-| Install orchestration (download → verify → commit) | Host tested, run on hardware |
-| Delta updates (`esp_delta_ota`) | Host tested, run on hardware |
+| Phoenix v2 frame codec | ✅ |
+| Join payload / firmware metadata | ✅ |
+| Update payload, decisions, progress throttling | ✅ |
+| Checksums | ✅ |
+| Install orchestration (download → verify → commit) | ✅ |
+| Delta updates (`esp_delta_ota`) | ✅ |
 | WebSocket transport (`esp_websocket_client`) | Run on hardware, over `ws://` and shared secrets |
-| HTTP download (`EspHttpConnection`) | Run on hardware |
-| `esp_ota` apply, rollback confirmation | Run on hardware, including a real rollback |
-| Extensions: health, geo, logging | Run on hardware |
-| Reboot and identify | Run on hardware |
-| mTLS transport | Compiles, never run — the bench uses shared secrets |
+| HTTP download (`EspHttpConnection`) | ✅ |
+| `esp_ota` apply, rollback confirmation | ✅ |
+| Extensions: health, geo, logging | ✅ |
+| Reboot and identify | ✅ |
+| Console: a fixed set of commands | ✅ |
+| mTLS transport | Compiles, never run; the bench uses shared secrets |
 | Device identity from NVS | Compiles, never run |
-| Anything on a fleet, or for longer than an afternoon | **Not done** |
-
-Two checks back the host side up:
-
-- `cargo test` — 119 tests of the protocol, install, extensions and logging
-  layers, on the host, with no ESP toolchain.
-- `cargo +esp check-esp32 --all-targets` — the whole crate *and* the example
-  agent type-checked against real ESP-IDF v5.2.3 headers.
 
 ## Requirements
 
 - ESP-IDF, via `esp-idf-svc` (std). The `no_std` `esp-hal` stack is not
   supported: it brings no ESP-IDF, and therefore no `esp_ota`, no
   `esp_websocket_client`, and no mbedTLS.
-- Two app partitions plus `otadata` — see `partitions.csv`.
-- `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` — see `sdkconfig.defaults`.
+- Two app partitions plus `otadata`. See `partitions.csv`.
+- `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. See `sdkconfig.defaults`.
 - The `espressif/esp_websocket_client` managed component. It is **not** part of
-  core ESP-IDF, and `esp_idf_svc::ws::client` is cfg-gated on its presence — so
+  core ESP-IDF, and `esp_idf_svc::ws::client` is cfg-gated on its presence, so
   without it the module silently does not exist and you get an unresolved
   import. See the note below.
 - The `espressif/esp_delta_ota` managed component, which applies the patches
@@ -92,7 +81,7 @@ library build. `partitions.csv` is a working example to copy.
 Note also that cargo does not invalidate a build script when `package.metadata`
 changes. After editing the `extra_components` block you must
 `cargo clean -p esp-idf-sys` or the change is silently ignored.
-- Xtensa parts (ESP32, S2, S3) need the `esp` rustc fork — `espup install`,
+- Xtensa parts (ESP32, S2, S3) need the `esp` rustc fork: `espup install`,
   then build with `+esp`. RISC-V parts (C3, C6, H2, P4) build on stable.
 
 There is deliberately **no `rust-toolchain.toml`**: pinning the `esp` channel
@@ -111,8 +100,8 @@ so that is the target with hardware behind it.
 
 The device aliases live in `.cargo/config.toml`. They carry
 `-Zbuild-std=std,panic_abort`, which the esp toolchain needs because it ships no
-prebuilt `std` for the espidf targets — and which cannot go in `[unstable]`,
-because that would apply to host builds and break `cargo test` on stable.
+prebuilt `std` for the espidf targets. It cannot go in `[unstable]`, because
+that would apply to host builds and break `cargo test` on stable.
 
 ## Usage
 
@@ -134,7 +123,7 @@ fn main() -> Result<(), nerves_hub_link_esp32::Error> {
 
 That reads the client certificate from NVS and the running firmware from
 `esp_app_desc_t`, connects, joins, confirms the running image once NervesHub
-accepts it, heartbeats, and installs updates as they arrive — rebooting into
+accepts it, heartbeats, and installs updates as they arrive, rebooting into
 each one. See `examples/basic.rs`.
 
 Bring the clock up before this, with SNTP. See [Authentication](#authentication)
@@ -174,7 +163,7 @@ See `examples/advanced.rs`.
 
 ### 3. You own everything
 
-`Agent` is generic over a [`Platform`] — the trait holding every operation that
+`Agent` is generic over a [`Platform`], the trait holding every operation that
 touches the world: connect, download, write flash, confirm, reboot, sleep, clock.
 `EspPlatform` is one implementation. Supplying another gets you a different
 transport, a different flash target, or a simulated device for testing your own
@@ -185,23 +174,23 @@ machine, generic over `Transport`), `install` (download → verify → commit,
 generic over `HttpStream` and `ImageSink`), `message` (the wire format).
 
 The loop deliberately lives in the library rather than in an example. Its
-sequencing has several things that are easy to get wrong and silent when you do
-— confirming the running image only *after* the join succeeds, aborting a failed
-install without rebooting, backing off only when a session never joined — and
-none of that could be tested while it was code users copied.
+sequencing has several things that are easy to get wrong and silent when you
+do: confirming the running image only *after* the join succeeds, aborting a failed
+install without rebooting, backing off only when a session never joined. None of
+that could be tested while it was code users copied.
 
-One thing the loop does **not** do: it runs the download synchronously, so for
-its duration no heartbeats are sent, no frames are read, and no logs are
-drained. Progress messages keep the socket busy, which is enough for
-NervesHub's 180 second timeout at the sizes and link speeds tried so far. A
-slower link or a larger image would want the download to service the connection
-between chunks.
+The download runs on that same loop, and services the connection between
+chunks: heartbeats and queued log lines go out while an image comes down, and a
+heartbeat that cannot be sent is how the download learns the connection has
+gone. Nothing is read during one, and nothing needs to be: frames arriving
+queue on the transport and are handled when it finishes, so a console command
+typed mid-update is answered late rather than lost.
 
 ## Project setup
 
 Five things, none of which this crate can do for you.
 
-**1. Cargo.toml.** `esp-idf-sys` reads `package.metadata` only from the root
+**1. Cargo.toml**: `esp-idf-sys` reads `package.metadata` only from the root
 package of a build, so this is *not* inherited from the dependency:
 
 ```toml
@@ -216,7 +205,7 @@ remote_component = { name = "espressif/esp_delta_ota", version = "^1.1" }
 bindings_header = "include/delta_ota_bindings.h"
 ```
 
-**2. `sdkconfig.defaults`:**
+**2. `sdkconfig.defaults`**:
 
 ```
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
@@ -230,16 +219,16 @@ CONFIG_APP_PROJECT_VER="1.0.0"
 
 The version is not optional. NervesHub reads it from `esp_app_desc_t`, at
 upload and from the running device, and it has to parse as SemVer. Left unset,
-ESP-IDF fills it from `git describe`, which does not — and a device reporting an
+ESP-IDF fills it from `git describe`, which does not. A device reporting an
 unparseable version has no firmware metadata server-side, so it can never match
 a deployment while looking perfectly healthy.
 
-**3. `partitions.csv`** — two app slots, `otadata`, and a `certs` partition.
+**3. `partitions.csv`**: two app slots, `otadata`, and a `certs` partition.
 Copy the one in this repo. Both app slots must be identical in size and large
 enough for the biggest image you will ever ship; an image that outgrows its slot
 fails on the device, in the field.
 
-**4. The project name in the image.** NervesHub matches `esp_app_desc_t`'s
+**4. The project name in the image**: NervesHub matches `esp_app_desc_t`'s
 `project_name` against the product an image is uploaded to. ESP-IDF takes that
 field from the CMake project name, which `esp-idf-sys` hardcodes to
 `libespidf`, so every Rust image claims to be a product called `libespidf` and
@@ -254,14 +243,14 @@ On the ELF, not the `.bin`: the image's SHA-256 is computed during
 `elf2image`, so patching afterwards invalidates it and the bootloader refuses
 to start the image.
 
-**5. A device identity.** Either scheme works; the device needs one of them.
+**5. A device identity**: either scheme works; the device needs one of them.
 
-For **shared secrets**, nothing is provisioned — the identifier and secret are
+For **shared secrets**, nothing is provisioned: the identifier and secret are
 configuration, and a product-wide secret registers unknown devices on first
 connection. That is the quickest way to a working bench.
 
 For **mTLS**, a device certificate in NVS. NervesHub identifies a device by its client
-certificate — it pins the SHA-1 fingerprint of the DER, so the certificate does
+certificate. It pins the SHA-1 fingerprint of the DER, so the certificate does
 **not** need a CA. A self-signed, per-device certificate is enough. [`nh`](https://github.com/nerves-hub/nh) 
 does the whole identity half in one command:
 
@@ -289,12 +278,12 @@ esptool.py --port /dev/tty.usbmodem write_flash 0x3E0000 certs.bin
 ```
 
 Both tools ship with ESP-IDF. The `0x3E0000` offset is the `certs` partition in
-`partitions.csv` — change it if you change the table.
+`partitions.csv`. Change it if you change the table.
 
 The NVS partition, namespace and key names are exported from `identity`
 (`PARTITION`, `NAMESPACE`, `CERTIFICATE_KEY`, `PRIVATE_KEY_KEY`) and are
 deliberately visible off-device, so tooling that writes the image can reference
-them rather than repeat the strings — a drift there surfaces as a TLS handshake
+them rather than repeat the strings. A drift there surfaces as a TLS handshake
 failure that says nothing about a renamed key.
 
 In production, provision at manufacture and enable NVS encryption: the private
@@ -345,7 +334,7 @@ ESP-IDF's rollback protocol and NervesHub's `firmware_validated` work in harmony
    reverts on the next reset.
 
 This crate confirms only **after** rejoining NervesHub. Confirming at startup
-would cancel the rollback for an image that cannot reach the server — the exact
+would cancel the rollback for an image that cannot reach the server, the exact
 failure rollback exists to catch.
 
 ## Delta updates
@@ -354,9 +343,9 @@ NervesHub sends a patch rather than a whole image where it has one. On the
 firmware this project builds, a patch runs from 1.6% of the image for a version
 bump to 7.3% for a release's worth of changes.
 
-Nothing to configure on the device. An update says nothing about which it is —
+Nothing to configure on the device. An update says nothing about which it is:
 `firmware_url` looks the same either way and the checksum is of whatever was
-sent — so the agent reads the first byte: an application image opens with the
+sent. So the agent reads the first byte. An application image opens with the
 magic the bootloader insists on, and anything else is treated as a patch. A
 patch is fed to `esp_delta_ota`, which reads the running slot and writes the
 rebuilt image into the inactive one.
@@ -401,23 +390,67 @@ esp::agent_with(config, AlwaysApply)?
 `on_identify` runs when an operator presses Identify in NervesHub. Reboot needs
 nothing: the agent answers it and restarts.
 
+## The console
+
+NervesHub can attach a terminal to a device. On Nerves the far end is an IEx
+session, which is why it works there: something is already running that takes
+text in and gives text back. An ESP32 has nothing equivalent, so this puts a
+fixed set of commands on the far end instead.
+
+```
+esp32> partitions
+running   ota_0    at 0x020000   1966080 bytes  valid
+next      ota_1    at 0x200000   1966080 bytes  INVALID, rolled back
+
+esp32> heap
+total        338384
+free         198224
+min free     161136   low-water mark
+largest      110592   largest single block
+```
+
+Off unless asked for, because it is a remote command surface:
+
+```rust
+esp::agent_with(config, AlwaysApply)?
+    .with_console()
+    .command("relay", "on|off — drive the relay", move |args, out| {
+        match args {
+            ["on"] => writeln!(out, "relay on")?,
+            _ => writeln!(out, "usage: relay on|off")?,
+        }
+        Ok(())
+    })
+    .run()?;
+```
+
+It brings `help`, `info`, `uptime`, `reboot`, `log`, and on a device also
+`heap`, `wifi`, `partitions` and `reset-reason`. Each answers from something
+the agent already reads, which is the rule for adding one: a command needing
+new plumbing is a feature wearing a command's clothes.
+
+Two earn their place beyond convenience. `partitions` separates "this device is
+on old firmware" from "this device tried the new firmware and the bootloader
+threw it out", which is otherwise only visible over a serial cable. `log debug`
+raises what is forwarded to NervesHub and `log info` lowers it again, which is
+unaffordable across a fleet and free on one device while someone watches it.
+
+**Every command is a Rust function compiled into the image.** There is no eval
+and no way to reach anything the firmware did not ship with. That is the
+security property, and it is why the vocabulary stays fixed even when a general
+escape hatch would be convenient. File transfers, which are part of the
+channel, are declined out loud rather than ignored.
+
 ## Not supported (yet)
 
-- **Resumable downloads.** NervesHub sends `partials_checksums` so an
+- **Resumable downloads**: NervesHub sends `partials_checksums` so an
   interrupted transfer can be resumed and verified chunk-wise. This restarts
   from zero instead.
-- **Updating the VM or bootloader.** Application partition only.
-- **The console.** NervesHub carries a remote terminal on a third channel of
-  the device socket, `console`, alongside `device` and `extensions`: the device
-  sends output as `up`, receives keystrokes as `dn`, and the server keeps a
-  thousand lines of scrollback so someone attaching sees recent history. On
-  Nerves, `nerves_hub_link` wires that to an IEx session. There is no equivalent
-  session on an ESP32 to attach — the channel is a pipe, and what goes in it is
-  the agent's to decide.
+- **Updating the VM or bootloader**: application partition only.
 - **Support scripts** (`scripts/run` on the `device` channel), which ask a
-  device to run something and report what it printed. Same shape of problem as
-  the console.
-- **Local shell and network identity extensions.** Health, geo and logging are
+  device to run supplied code. There is no interpreter here to run it in, and
+  adding one would undo the property that makes the console safe.
+- **Local shell and network identity extensions**: health, geo and logging are
   implemented; these two are not.
 
 ## Layout
@@ -452,7 +485,7 @@ socket, and `install.rs` against a fake network and fake flash. The frames, the
 sequencing and the install decisions are the parts most likely to be wrong; the
 sockets are not.
 
-That is also why `install.rs` — not `ota.rs` — owns checksum verification and
+That is also why `install.rs`, not `ota.rs`, owns checksum verification and
 the decision to commit. "Never make a corrupt image bootable" is a rule worth a
 test, and it can only have one on the host.
 
@@ -467,7 +500,7 @@ cargo +esp esp32 --example local  # device build of the bench example
 The host tests need no ESP toolchain, which is the point: the frames, the
 sequencing and the install decisions are the parts most likely to be wrong.
 
-`examples/local.rs` is the one that has actually been run — it brings WiFi up
+`examples/local.rs` is the one that has actually been run. It brings WiFi up
 itself, authenticates with a shared secret, and enables health, geo and
 logging, so there is nothing to provision first. Copy
 `local_config.rs.template` to `local_config.rs` in the crate root and fill it
