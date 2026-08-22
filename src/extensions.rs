@@ -124,13 +124,21 @@ pub trait HealthProvider {
 }
 
 /// A log line for NervesHub.
+///
+/// # The time is not optional
+///
+/// NervesHub requires a timestamp and does *not* supply one on arrival: a line
+/// that arrives without one fails validation and is dropped without a reply,
+/// so the device cannot tell. It is carried as `meta.time`, in microseconds
+/// since the epoch, as a string -- the same place and format Elixir devices put
+/// it. Use [`LogLine::with_time`], or [`LogLine::has_time`] to check.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogLine {
     /// `"debug"`, `"info"`, `"warning"`, `"error"` — stored as given.
     pub level: String,
     pub message: String,
-    /// RFC3339. Omitted if the device clock is not set, in which case the
-    /// server timestamps on arrival.
+    /// Unused by NervesHub, which reads the time from `meta.time` instead.
+    /// Kept because the field is part of the shape other clients send.
     pub timestamp: Option<String>,
     pub meta: Vec<(String, String)>,
 }
@@ -148,6 +156,17 @@ impl LogLine {
     pub fn meta(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.meta.push((key.into(), value.into()));
         self
+    }
+
+    /// Stamp the line, in microseconds since the epoch.
+    ///
+    /// Required: see the type docs. A line without one is discarded server-side.
+    pub fn with_time(self, unix_micros: u64) -> Self {
+        self.meta("time", unix_micros.to_string())
+    }
+
+    pub fn has_time(&self) -> bool {
+        self.meta.iter().any(|(key, _)| key == "time")
     }
 
     pub fn payload(&self) -> Value {
@@ -257,6 +276,11 @@ impl Extensions {
 
     pub fn joined(&self) -> bool {
         self.joined
+    }
+
+    /// What the platform attached. Empty until the join is answered.
+    pub fn attached(&self) -> &[String] {
+        &self.attached
     }
 
     pub fn is_attached(&self, key: &str) -> bool {

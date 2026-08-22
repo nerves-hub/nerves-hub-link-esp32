@@ -13,13 +13,15 @@
 //! covered it. Here it is library code with a fake [`Platform`] behind it.
 
 use core::time::Duration;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::extensions::{HealthProvider, LocationProvider, Outgoing};
 use crate::error::Error;
 use crate::install::{install, HttpStream, ImageSink};
 use crate::link::{Action, Link, Transport, UpdateHandler};
-use crate::metadata::FirmwareMetadata;
+use crate::logging::LogBuffer;
+use crate::metadata::{BootReport, FirmwareMetadata};
 use crate::ota::PendingVerify;
 use crate::update::Stage;
 
@@ -46,6 +48,16 @@ pub trait Platform {
     /// Whether this boot is an unconfirmed update.
     fn pending_verify(&mut self) -> PendingVerify;
 
+    /// Whether the bootloader rolled back to the image now running, because the
+    /// last update failed to prove itself.
+    ///
+    /// Defaults to "no". A platform that cannot tell should say so rather than
+    /// guess: NervesHub treats this as a device in trouble, and a false report
+    /// is worse than no report.
+    fn auto_revert_detected(&mut self) -> bool {
+        false
+    }
+
     /// Confirm the running image, cancelling the pending rollback.
     fn mark_valid(&mut self) -> Result<(), Error>;
 
@@ -58,6 +70,13 @@ pub trait Platform {
     /// Milliseconds from an arbitrary origin. Only differences are used.
     fn now_ms(&mut self) -> u64;
 }
+
+/// How long to wait between log lines.
+///
+/// NervesHub allows five a second per device and drops the rest without
+/// telling the device, so this stays under it with room to spare. A backlog
+/// drains slowly, which is the intended trade: late beats discarded.
+const LOG_SEND_INTERVAL_MS: u64 = 250;
 
 /// Why the loop stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +97,7 @@ pub struct Agent<P, H> {
     location: Option<Box<dyn LocationProvider>>,
     health: Option<Box<dyn HealthProvider>>,
     identify: Option<Box<dyn FnMut()>>,
+    logs: Option<Arc<LogBuffer>>,
 }
 
 impl<P: Platform, H: UpdateHandler> Agent<P, H> {
@@ -86,6 +106,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             location: None,
             health: None,
             identify: None,
+            logs: None,
             config,
             metadata,
             platform,
@@ -102,6 +123,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             location: self.location,
             health: self.health,
             identify: self.identify,
+            logs: self.logs,
             handler,
         }
     }
@@ -118,6 +140,18 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     /// Answer `health:check` with this.
     pub fn with_health(mut self, provider: impl HealthProvider + 'static) -> Self {
         self.health = Some(Box::new(provider));
+        self
+    }
+
+    /// Send the device's log to NervesHub, from the buffer `logging::install`
+    /// returns.
+    ///
+    /// Lines go out one at a time with a gap between them, because the platform
+    /// rate limits log traffic per device and a device that trips that limit
+    /// has its lines dropped server-side, where it cannot tell. Pacing on the
+    /// device means a burst arrives late rather than not at all.
+    pub fn with_logs(mut self, logs: Arc<LogBuffer>) -> Self {
+        self.logs = Some(logs);
         self
     }
 
@@ -182,10 +216,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
 
         loop {
             let mut transport = match self.platform.connect(&self.config) {
-                Ok(transport) => {
-                    attempt = 0;
-                    transport
-                }
+                Ok(transport) => transport,
                 // A bad or missing certificate will not fix itself, and a
                 // device silently retrying forever is worse than one that says
                 // why it cannot connect.
@@ -198,33 +229,76 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
             };
 
-            match self.session(&mut transport) {
+            let mut joined = false;
+            let outcome = self.session(&mut transport, &mut joined);
+
+            match outcome {
                 Ok(Some(stopped)) => return Ok(stopped),
-                Ok(None) => continue,
+                Ok(None) => {}
                 // Every send in a session is written as `?`, so a socket that
                 // dies mid-write arrives here. That is a reconnect, not the end
                 // of the agent: a device that stops talking to NervesHub
                 // because one heartbeat missed its socket is a device that
                 // needs a site visit.
-                Err(Error::Transport(_)) => continue,
+                Err(Error::Transport(_)) => {}
                 Err(err) => return Err(err),
             }
+
+            // Opening a socket is not the same as having a session on it. Only
+            // a session that got as far as a join counts as progress worth
+            // resetting the backoff for -- otherwise a socket that connects and
+            // dies immediately reconnects as fast as the hardware allows, which
+            // is a device hammering a server that is already unhappy.
+            if joined {
+                attempt = 0;
+            }
+
+            let wait = self.config.backoff_for(attempt);
+
+            if !joined {
+                attempt = attempt.saturating_add(1);
+            }
+            log::info!("session ended (joined: {joined}); reconnecting in {wait}s");
+            self.platform.sleep(Duration::from_secs(wait));
         }
     }
 
     /// One connection's lifetime. `None` means reconnect.
-    fn session(&mut self, transport: &mut P::Transport) -> Result<Option<Stopped>, Error> {
+    ///
+    /// `joined` is set once the platform accepts the join, which is what tells
+    /// the caller whether this connection ever became a session.
+    fn session(
+        &mut self,
+        transport: &mut P::Transport,
+        joined: &mut bool,
+    ) -> Result<Option<Stopped>, Error> {
         let mut link = Link::new(self.config.clone(), self.metadata.clone());
 
-        link.send_join(transport)?;
+        // Both facts are read from the join, not from a later message. That is
+        // deliberate on the platform's side: a device that reverted may never
+        // get far enough to send anything else, and the revert is exactly the
+        // thing worth knowing about it.
+        let boot = BootReport {
+            firmware_validated: self.platform.pending_verify() == PendingVerify::No,
+            firmware_auto_revert_detected: self.platform.auto_revert_detected(),
+        };
+
+        if boot.firmware_auto_revert_detected {
+            log::warn!("the bootloader reverted to this image; the last update did not come up");
+        }
+
+        link.send_join(transport, boot)?;
 
         let mut confirmed = false;
         let mut extensions_joined = false;
+        let mut extensions_reported = false;
+        let mut last_log = self.platform.now_ms();
         let mut last_heartbeat = self.platform.now_ms();
         let heartbeat_ms = self.config.heartbeat_interval_secs * 1_000;
 
         loop {
             if link.joined() && !confirmed {
+                *joined = true;
                 self.confirm_running_image(&mut link, transport)?;
                 confirmed = true;
             }
@@ -237,11 +311,38 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 extensions_joined = true;
             }
 
+            // Which extensions the platform actually attached is the answer to
+            // most "why is nothing arriving" questions, and the device is the
+            // only place both halves are visible.
+            if link.extensions_joined() && !extensions_reported {
+                extensions_reported = true;
+                log::info!(
+                    "extensions attached: {:?}; {} log lines queued",
+                    link.attached_extensions(),
+                    self.logs.as_ref().map(|logs| logs.len()).unwrap_or(0)
+                );
+            }
+
             let now = self.platform.now_ms();
 
             if now.saturating_sub(last_heartbeat) >= heartbeat_ms {
                 link.send_heartbeat(transport)?;
                 last_heartbeat = now;
+            }
+
+            // One line per interval, and only once the platform has attached
+            // logging -- popping before then would discard the line into a
+            // channel nothing is listening on.
+            if link.logging_attached() && now.saturating_sub(last_log) >= LOG_SEND_INTERVAL_MS {
+                let pending = self
+                    .logs
+                    .as_ref()
+                    .and_then(|logs| logs.pop_stamped(crate::logging::unix_micros()));
+
+                if let Some(line) = pending {
+                    link.send_log(transport, &line)?;
+                    last_log = now;
+                }
             }
 
             let frame = match transport.recv() {
@@ -620,7 +721,7 @@ mod tests {
         // The socket then dies, so run() would loop forever; drive one session.
         let mut agent = agent(plat);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         assert_eq!(shared.borrow().marked_valid, 1);
         assert!(events(&shared).contains(&"firmware_validated".to_string()));
@@ -636,7 +737,7 @@ mod tests {
 
         let mut agent = agent(plat);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         assert_eq!(shared.borrow().marked_valid, 0);
         assert!(!events(&shared).contains(&"firmware_validated".to_string()));
@@ -651,7 +752,7 @@ mod tests {
 
         let mut agent = agent(plat);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         assert_eq!(shared.borrow().marked_valid, 0);
         assert!(events(&shared).contains(&"firmware_validated".to_string()));
@@ -691,7 +792,7 @@ mod tests {
 
         let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         let sent = shared.borrow().sent.clone();
 
@@ -720,7 +821,39 @@ mod tests {
             vec![
                 Duration::from_secs(1),
                 Duration::from_secs(2),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                // The session joined, so the backoff starts over rather than
+                // carrying on from where the failures left it.
+                Duration::from_secs(1),
+            ]
+        );
+    }
+
+    // A socket that opens and dies without ever joining is not progress, and
+    // reconnecting on it at full speed is a device hammering a server that is
+    // already in trouble. Observed on hardware as roughly two connections a
+    // second, indefinitely.
+    #[test]
+    fn a_session_that_never_joins_backs_off() {
+        // Four sockets that connect and immediately report a dead socket.
+        let plat = platform(vec![
+            vec![Err(Error::Transport("closed".into()))],
+            vec![Err(Error::Transport("closed".into()))],
+            vec![Err(Error::Transport("closed".into()))],
+            vec![Err(Error::Transport("closed".into()))],
+        ]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat);
+        let _ = agent.run();
+
+        assert_eq!(
+            shared.borrow().slept,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
             ]
         );
     }
@@ -772,7 +905,7 @@ mod tests {
 
         let mut agent = agent(plat);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         assert_eq!(shared.borrow().restarts, 0);
         assert_eq!(shared.borrow().commits, 0);
@@ -815,7 +948,7 @@ mod tests {
 
         let mut agent = agent(plat).with_handler(Decline);
         let mut transport = agent.platform.connect(&config()).unwrap();
-        let _ = agent.session(&mut transport);
+        let _ = agent.session(&mut transport, &mut false);
 
         assert_eq!(shared.borrow().commits, 0);
         assert_eq!(shared.borrow().restarts, 0);

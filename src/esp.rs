@@ -57,6 +57,10 @@ impl Platform for EspPlatform {
         ota::pending_verify()
     }
 
+    fn auto_revert_detected(&mut self) -> bool {
+        ota::auto_revert_detected()
+    }
+
     fn mark_valid(&mut self) -> Result<(), Error> {
         ota::mark_valid()
     }

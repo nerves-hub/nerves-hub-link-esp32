@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
 use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
-use crate::metadata::FirmwareMetadata;
+use crate::metadata::{BootReport, FirmwareMetadata};
 use crate::update::{Stage, UpdateDecision, UpdatePayload};
 
 /// A bidirectional frame channel. Implemented over `esp_websocket_client` on
@@ -94,14 +94,20 @@ impl Link {
     }
 
     /// Send `phx_join`. The reply is handled by `handle_frame`.
-    pub fn send_join<T: Transport>(&mut self, transport: &mut T) -> Result<(), Error> {
+    pub fn send_join<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        boot: BootReport,
+    ) -> Result<(), Error> {
         let reference = self.refs.next_ref();
         self.join_ref = Some(reference.clone());
         self.joined = false;
 
-        let params = self
-            .metadata
-            .join_params(&self.config.device_api_version, self.downloading.as_deref());
+        let params = self.metadata.join_params(
+            &self.config.device_api_version,
+            self.downloading.as_deref(),
+            boot,
+        );
 
         self.send(
             transport,
@@ -219,6 +225,17 @@ impl Link {
 
     pub fn extensions_joined(&self) -> bool {
         self.extensions.joined()
+    }
+
+    /// Whether the platform attached logging, which is the only state in which
+    /// sending a line does anything.
+    pub fn logging_attached(&self) -> bool {
+        self.extensions.is_attached(crate::extensions::LOGGING)
+    }
+
+    /// What the platform attached, which is not necessarily what was offered.
+    pub fn attached_extensions(&self) -> &[String] {
+        self.extensions.attached()
     }
 
     /// Join the extensions channel. Only after the device channel is joined —
@@ -443,7 +460,7 @@ mod tests {
     #[test]
     fn join_targets_the_unqualified_device_topic() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let sent = transport.last();
         assert_eq!(sent.topic, "device");
@@ -459,7 +476,7 @@ mod tests {
     fn a_download_in_progress_is_reported_on_join() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
         link.set_downloading(Some("uuid-in-flight".into()));
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         assert_eq!(
             transport.last().payload["currently_downloading_uuid"],
@@ -470,7 +487,7 @@ mod tests {
     #[test]
     fn an_idle_device_sends_no_currently_downloading_uuid() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         assert!(transport
             .last()
@@ -482,7 +499,7 @@ mod tests {
     #[test]
     fn heartbeats_go_to_the_phoenix_topic_without_a_join_ref() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
         link.send_heartbeat(&mut transport).unwrap();
 
         let sent = transport.last();
@@ -494,7 +511,7 @@ mod tests {
     #[test]
     fn a_successful_join_reply_marks_the_link_joined() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = r#"["1","1","device","phx_reply",{"status":"ok","response":{"update_available":false}}]"#;
 
@@ -509,7 +526,7 @@ mod tests {
     #[test]
     fn a_refused_join_is_an_error() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = r#"["1","1","device","phx_reply",{"status":"error","response":{"reason":"could not connect"}}]"#;
 
@@ -526,7 +543,7 @@ mod tests {
     #[test]
     fn an_update_in_the_join_reply_is_acted_on() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = format!(
             r#"["1","1","device","phx_reply",{{"status":"ok","response":{}}}]"#,
@@ -553,7 +570,7 @@ mod tests {
     #[test]
     fn a_reboot_request_is_acted_on() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = r#"[null,null,"device","reboot",{}]"#;
 
@@ -566,7 +583,7 @@ mod tests {
     #[test]
     fn an_identify_request_is_acted_on() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = r#"[null,null,"device","identify",{}]"#;
 
@@ -582,7 +599,7 @@ mod tests {
     #[test]
     fn a_completed_status_names_the_status_the_server_records() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
         link.send_status(&mut transport, "completed", json!({})).unwrap();
 
         let sent = transport.last();
@@ -594,7 +611,7 @@ mod tests {
     #[test]
     fn a_pushed_update_is_acted_on() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = format!(r#"[null,null,"device","update",{}]"#, update_response());
 
@@ -608,7 +625,7 @@ mod tests {
     #[test]
     fn ignoring_an_update_reports_it_rather_than_going_quiet() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let mut handler = Decider(UpdateDecision::Ignore {
             reason: "on battery".into(),
@@ -630,7 +647,7 @@ mod tests {
     #[test]
     fn rescheduling_sends_the_delay_the_server_expects() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let mut handler = Decider(UpdateDecision::Reschedule {
             delay_ms: 60_000,
@@ -650,7 +667,7 @@ mod tests {
     #[test]
     fn an_update_with_nothing_to_download_is_ignored() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let frame = r#"[null,null,"device","update",{"update_available":false}]"#;
 
@@ -664,7 +681,7 @@ mod tests {
     #[test]
     fn a_channel_close_asks_for_a_reconnect() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
         link.joined = true;
 
         let frame = r#"[null,null,"device","phx_close",{}]"#;
@@ -680,7 +697,7 @@ mod tests {
     #[test]
     fn progress_uses_the_tool_neutral_event() {
         let (mut link, mut transport) = (link(), FakeTransport::default());
-        link.send_join(&mut transport).unwrap();
+        link.send_join(&mut transport, BootReport::default()).unwrap();
         link.send_progress(&mut transport, Stage::Downloading, 42)
             .unwrap();
 

@@ -31,7 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use nerves_hub_link_esp32::{esp, AlwaysApply, Config, Credentials};
 
     esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+
+    // Instead of EspLogger::initialize_default(): the same output on the serial
+    // console, plus a copy of everything at info or worse kept for NervesHub.
+    let logs = nerves_hub_link_esp32::logging::install(log::LevelFilter::Info, log::Level::Info);
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -82,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Offered, not assumed: the platform attaches these only if the product has
     // them enabled.
-    nh.extensions = Enabled::none().health().geo();
+    nh.extensions = Enabled::none().health().geo().logging();
 
     if !nh.use_tls {
         log::warn!("connecting over plain ws:// — bench use only");
@@ -97,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     esp::agent_with(nh, AlwaysApply)?
         .with_health(EspHealth::new())
         .with_location(Whenwhere::new())
+        .with_logs(logs)
         .on_identify(move || {
             log::warn!("=== IDENTIFY: this is the device you are looking at ===");
             for _ in 0..10 {

@@ -45,6 +45,7 @@ impl FirmwareMetadata {
         &self,
         device_api_version: &str,
         currently_downloading_uuid: Option<&str>,
+        boot: BootReport,
     ) -> Value {
         let mut params = json!({
             "device_api_version": device_api_version,
@@ -60,7 +61,34 @@ impl FirmwareMetadata {
             params["currently_downloading_uuid"] = json!(uuid);
         }
 
+        params["meta"] = boot.payload();
+
         params
+    }
+}
+
+/// What the device can say at join time about the image it is running.
+///
+/// Both facts are only knowable at startup, and both are read by NervesHub from
+/// the join rather than from a later message -- which matters, because a device
+/// that reverted may never get as far as sending anything else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootReport {
+    /// The running image is not on probation: either it was confirmed, or it
+    /// was never on probation because it arrived over a cable.
+    pub firmware_validated: bool,
+    /// The bootloader rolled back to this image because the last update failed
+    /// to prove itself. NervesHub shows this as "Revert detected" and stops
+    /// treating the device as merely out of date.
+    pub firmware_auto_revert_detected: bool,
+}
+
+impl BootReport {
+    pub fn payload(&self) -> Value {
+        json!({
+            "firmware_validated": self.firmware_validated,
+            "firmware_auto_revert_detected": self.firmware_auto_revert_detected,
+        })
     }
 }
 
@@ -152,7 +180,7 @@ mod tests {
 
     #[test]
     fn join_params_match_what_nerveshub_reads() {
-        let params = metadata().join_params("2.2.0", None);
+        let params = metadata().join_params("2.2.0", None, BootReport::default());
 
         // These key names are a contract with
         // NervesHub.Firmwares.UpdateTool.EspIdf.metadata_from_device/1.
@@ -166,20 +194,47 @@ mod tests {
 
     #[test]
     fn no_uuid_is_sent() {
-        let params = metadata().join_params("2.2.0", None);
+        let params = metadata().join_params("2.2.0", None, BootReport::default());
         assert!(params.get("uuid").is_none());
         assert!(params.get("nerves_fw_uuid").is_none());
     }
 
     #[test]
     fn currently_downloading_is_omitted_when_absent() {
-        let params = metadata().join_params("2.2.0", None);
+        let params = metadata().join_params("2.2.0", None, BootReport::default());
         assert!(params.get("currently_downloading_uuid").is_none());
     }
 
     #[test]
     fn currently_downloading_is_included_when_present() {
-        let params = metadata().join_params("2.2.0", Some("abc-123"));
+        let params = metadata().join_params("2.2.0", Some("abc-123"), BootReport::default());
         assert_eq!(params["currently_downloading_uuid"], "abc-123");
+    }
+
+    // NervesHub reads both of these from the join, under "meta". A device that
+    // reverted may never send anything after the join, so the join is the only
+    // place the fact reliably fits.
+    #[test]
+    fn the_join_carries_what_the_device_knows_about_its_own_boot() {
+        let boot = BootReport {
+            firmware_validated: true,
+            firmware_auto_revert_detected: false,
+        };
+        let params = metadata().join_params("2.2.0", None, boot);
+
+        assert_eq!(params["meta"]["firmware_validated"], json!(true));
+        assert_eq!(params["meta"]["firmware_auto_revert_detected"], json!(false));
+    }
+
+    #[test]
+    fn a_revert_is_reported_as_the_platform_names_it() {
+        let boot = BootReport {
+            firmware_validated: false,
+            firmware_auto_revert_detected: true,
+        };
+        let params = metadata().join_params("2.2.0", None, boot);
+
+        assert_eq!(params["meta"]["firmware_auto_revert_detected"], json!(true));
+        assert_eq!(params["meta"]["firmware_validated"], json!(false));
     }
 }

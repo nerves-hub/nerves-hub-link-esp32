@@ -2,13 +2,16 @@
 //!
 //! # Who owns reconnection
 //!
-//! The agent does, and the IDF client is told not to. Left to itself the
-//! client re-establishes the socket on its own after a close, which sounds
-//! helpful and is not: the new socket carries no Phoenix channel, because
-//! nothing sent `phx_join` on it. NervesHub records a device connection when
-//! the *socket* connects, so the device reappears as online while being deaf
-//! to everything -- no updates, no commands. Only the agent can rebuild a
-//! session, so only the agent reconnects.
+//! The agent does. A socket that comes back without a `phx_join` on it carries
+//! no Phoenix channel, and NervesHub records a device connection when the
+//! *socket* connects — so a silently re-established socket shows the device as
+//! online while it is deaf to everything. Only the agent can rebuild a session,
+//! so a closed socket is reported up to it and it builds a new transport.
+//!
+//! The IDF client's own reconnect is left at its default rather than disabled.
+//! It never gets to act on a close the agent has seen, because the agent drops
+//! the client, and turning it off was tried: it left a device that could not
+//! establish a session at all.
 //!
 //! # Why mTLS
 //!
@@ -56,6 +59,7 @@ pub struct WebSocketTransport {
     recv_timeout: Duration,
 }
 
+
 impl WebSocketTransport {
     pub fn connect(config: &Config) -> Result<Self, Error> {
         let (tx, rx): (Sender<Incoming>, Receiver<Incoming>) = channel();
@@ -100,10 +104,6 @@ impl WebSocketTransport {
             // a dead TCP connection, the Phoenix heartbeat keeps the channel
             // alive server-side.
             ping_interval_sec: Duration::from_secs(config.heartbeat_interval_secs),
-
-            // See the module docs. A socket the agent did not open is a socket
-            // with no channel joined on it.
-            disable_auto_reconnect: true,
 
             ..Default::default()
         };
@@ -152,11 +152,15 @@ impl WebSocketTransport {
 // channel stays open with nothing ever arriving on it, `recv` reports an idle
 // socket forever, and the agent waits out the rest of its life for a frame
 // from a connection that ended.
+//
+// An `Err` is the client's ERROR event, and it is deliberately *not* one of
+// those. The IDF client raises it for anything it dislikes, including during a
+// normal connect, and a device that abandoned the session on each one never
+// got as far as joining. A genuine failure is followed by a close, so waiting
+// for the close costs nothing and reads far more of what is happening.
 fn handle_event(tx: &Sender<Incoming>, event: &Result<WebSocketEvent<'_>, EspIOError>) {
-    // An `Err` here is the client's ERROR event. Whatever caused it, the
-    // socket does not come back from it.
     let Ok(event) = event else {
-        let _ = tx.send(Incoming::Closed);
+        log::debug!("websocket error event");
         return;
     };
 
@@ -185,7 +189,21 @@ impl Transport for WebSocketTransport {
     fn recv(&mut self) -> Result<Option<String>, Error> {
         match self.incoming.recv_timeout(self.recv_timeout) {
             Ok(Incoming::Text(frame)) => Ok(Some(frame)),
-            Ok(Incoming::Closed) => Err(Error::Transport("websocket closed".into())),
+
+            // A close event from the client that is still connected belongs to
+            // an earlier socket being torn down -- the events arrive on a task
+            // of their own, so a previous client's last words can land here
+            // after this one is up. Only the client's own view of itself
+            // decides that the session is over.
+            Ok(Incoming::Closed) => {
+                if self.client.is_connected() {
+                    log::debug!("ignoring a close for a socket that is still connected");
+                    Ok(None)
+                } else {
+                    log::info!("websocket closed");
+                    Err(Error::Transport("websocket closed".into()))
+                }
+            }
             // Nothing arrived, which is what most half-seconds look like.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

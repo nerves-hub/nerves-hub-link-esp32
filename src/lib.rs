@@ -54,6 +54,7 @@ pub mod http;
 pub mod identity;
 pub mod install;
 pub mod link;
+pub mod logging;
 pub mod message;
 pub mod metadata;
 pub mod ota;

@@ -192,6 +192,38 @@ pub fn pending_verify() -> PendingVerify {
     }
 }
 
+/// Whether the bootloader rolled back to the image now running.
+///
+/// An image that reboots while still on probation is marked
+/// `ESP_OTA_IMG_INVALID` by the bootloader, which then boots the other slot.
+/// So a device that finds the *other* slot marked invalid is a device running
+/// its predecessor because an update failed to prove itself.
+///
+/// This is current state rather than an event, which is what NervesHub wants:
+/// the flag reads true for as long as the failed image is still sitting there,
+/// and clears by itself when a later update overwrites that slot. So a device
+/// stays visibly reverted until something actually fixes it.
+///
+/// Only `INVALID` counts. `ABORTED` means a download was interrupted, which is
+/// an update that never started rather than one that failed.
+#[cfg(target_os = "espidf")]
+pub fn auto_revert_detected() -> bool {
+    use esp_idf_svc::sys;
+
+    unsafe {
+        // The next slot to be written is the one not running, which is where a
+        // failed image is left behind.
+        let other = sys::esp_ota_get_next_update_partition(core::ptr::null());
+        let mut state: sys::esp_ota_img_states_t = 0;
+
+        if other.is_null() || sys::esp_ota_get_state_partition(other, &mut state) != sys::ESP_OK {
+            return false;
+        }
+
+        state == sys::esp_ota_img_states_t_ESP_OTA_IMG_INVALID
+    }
+}
+
 /// Confirm the running image, cancelling the pending rollback.
 ///
 /// Call this only once the device is genuinely working — here, once it has
@@ -214,6 +246,11 @@ pub fn mark_valid() -> Result<(), Error> {
 #[cfg(not(target_os = "espidf"))]
 pub fn pending_verify() -> PendingVerify {
     PendingVerify::No
+}
+
+#[cfg(not(target_os = "espidf"))]
+pub fn auto_revert_detected() -> bool {
+    false
 }
 
 #[cfg(not(target_os = "espidf"))]
