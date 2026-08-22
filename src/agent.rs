@@ -463,6 +463,15 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 Ok(true)
             }
             Err(err) => {
+                // Logged as well as reported. `status_update` carries a reason
+                // that lands on the update record, but a failed update is the
+                // moment someone most wants the surrounding lines -- what the
+                // device decided the download was, how far it got, what the
+                // OTA layer said -- and those only reach NervesHub through the
+                // log. The device stays up after this, so the queued lines get
+                // sent rather than lost to a reboot.
+                log::error!("update failed: {err}");
+
                 link.send_status(
                     transport,
                     "failed",
