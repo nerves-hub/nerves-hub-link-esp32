@@ -767,14 +767,82 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     ) -> Result<(), Error> {
         let mut http = self.platform.http()?;
         let mut sink = self.platform.begin_update()?;
-        let handler = &mut self.handler;
         let step = self.config.progress_step_percent;
+        let heartbeat_ms = self.config.heartbeat_interval_secs * 1_000;
 
-        install(update, &mut http, &mut sink, step, &mut |stage, percent| {
-            handler.progress(stage, percent);
-            link.send_progress(transport, stage, percent)
-        })
-        .map(|_report| ())
+        // Disjoint borrows of two fields, which one `&mut self` would not give.
+        let Self {
+            platform, handler, logs, ..
+        } = self;
+
+        let now = platform.now_ms();
+
+        let mut pump = Pump {
+            link,
+            transport,
+            platform,
+            handler,
+            logs: logs.as_ref(),
+            heartbeat_ms,
+            last_heartbeat: now,
+            last_log: now,
+        };
+
+        install(update, &mut http, &mut sink, step, &mut pump).map(|_report| ())
+    }
+}
+
+/// Keeps the connection alive while an image comes down.
+///
+/// A download is the longest thing the agent does, and it used to own the loop
+/// for its whole duration: no heartbeats, no logs, nothing read. On a fast
+/// enough link that fits inside NervesHub's socket timeout by luck rather than
+/// design, and the margin shrinks with every megabyte and every slow network.
+///
+/// Nothing is read here, and nothing needs to be. Frames arriving during a
+/// download queue on the transport's channel and are handled when it finishes,
+/// so a console command typed mid-update is answered late rather than lost. A
+/// heartbeat that cannot be sent, on the other hand, is how the download learns
+/// the connection has gone -- the error abandons it rather than writing the
+/// rest of an image nobody will hear about.
+struct Pump<'a, P: Platform, H: UpdateHandler> {
+    link: &'a mut Link,
+    transport: &'a mut P::Transport,
+    platform: &'a mut P,
+    handler: &'a mut H,
+    logs: Option<&'a Arc<LogBuffer>>,
+    heartbeat_ms: u64,
+    last_heartbeat: u64,
+    last_log: u64,
+}
+
+impl<P: Platform, H: UpdateHandler> crate::install::Progress for Pump<'_, P, H> {
+    fn tick(&mut self) -> Result<(), Error> {
+        let now = self.platform.now_ms();
+
+        if now.saturating_sub(self.last_heartbeat) >= self.heartbeat_ms {
+            self.link.send_heartbeat(self.transport)?;
+            self.last_heartbeat = now;
+        }
+
+        if self.link.logging_attached() && now.saturating_sub(self.last_log) >= LOG_SEND_INTERVAL_MS
+        {
+            let pending = self
+                .logs
+                .and_then(|logs| logs.pop_stamped(crate::logging::unix_micros()));
+
+            if let Some(line) = pending {
+                self.link.send_log(self.transport, &line)?;
+                self.last_log = now;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn report(&mut self, stage: Stage, percent: u8) -> Result<(), Error> {
+        self.handler.progress(stage, percent);
+        self.link.send_progress(self.transport, stage, percent)
     }
 }
 
@@ -871,6 +939,10 @@ mod tests {
         image: Vec<u8>,
         connect_failures: usize,
         clock_ms: u64,
+        /// How far the fake clock jumps per reading. A download calls `now_ms`
+        /// once per chunk, so a test wanting to reach a heartbeat interval
+        /// winds this up rather than building a multi-megabyte image.
+        clock_step_ms: u64,
         send_fails: bool,
     }
 
@@ -929,7 +1001,7 @@ mod tests {
         }
 
         fn now_ms(&mut self) -> u64 {
-            self.clock_ms += 1;
+            self.clock_ms += self.clock_step_ms;
             self.clock_ms
         }
     }
@@ -976,6 +1048,7 @@ mod tests {
             image: vec![],
             connect_failures: 0,
             clock_ms: 0,
+            clock_step_ms: 1,
             send_fails: false,
         }
     }
@@ -1367,6 +1440,57 @@ mod tests {
                 Duration::from_secs(5),
                 Duration::from_secs(10),
             ]
+        );
+    }
+
+    // A download used to own the loop for its whole duration, so nothing was
+    // sent while an image came down. NervesHub's socket timeout is generous
+    // enough that this fit by luck rather than design, and the margin shrinks
+    // with every megabyte and every slow link.
+    #[test]
+    fn heartbeats_keep_flowing_while_an_image_downloads() {
+        let image = vec![7u8; 4096 * 12];
+
+        let update = json!({
+            "update_available": true,
+            "firmware_url": "https://example.test/fw.bin",
+            "firmware_meta": {"uuid": "uuid-1"},
+            "size": image.len(),
+            "checksum": sha256_upper(&image)
+        });
+
+        let mut plat = platform(vec![vec![join_reply(update)]]);
+        plat.image = image;
+        // Each chunk advances the clock half a heartbeat interval.
+        plat.clock_step_ms = 500;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut config = config();
+        config.heartbeat_interval_secs = 1;
+
+        let mut agent = Agent::new(config, metadata(), plat, AlwaysApply);
+        assert_eq!(agent.run().unwrap(), Stopped::Rebooting);
+
+        let events = events(&shared);
+
+        let first_progress = events
+            .iter()
+            .position(|event| event == "update_progress")
+            .expect("no progress was reported");
+
+        let finished = events
+            .iter()
+            .position(|event| event == "status_update")
+            .expect("the update never completed");
+
+        let beats = events[first_progress..finished]
+            .iter()
+            .filter(|event| *event == "heartbeat")
+            .count();
+
+        assert!(
+            beats > 0,
+            "no heartbeat between the first progress report and the end of the update: {events:?}"
         );
     }
 

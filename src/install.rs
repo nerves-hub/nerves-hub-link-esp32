@@ -30,6 +30,40 @@ pub trait HttpStream {
 }
 
 /// Somewhere to put an image.
+/// What the caller is told while an image is coming down.
+///
+/// Two methods rather than one closure because a download is long enough that
+/// the connection needs attention during it, and that attention is wanted far
+/// more often than a progress report is. `tick` runs after every chunk;
+/// `report` only when progress crosses the configured step.
+///
+/// A closure still works where only reporting is wanted -- see the blanket
+/// implementation below -- which is what the tests use.
+pub trait Progress {
+    /// After every chunk written.
+    ///
+    /// The download otherwise owns the agent for its whole duration: no
+    /// heartbeats sent, no logs drained. Returning an error abandons the
+    /// download, which is what should happen when the connection has gone --
+    /// there is no point writing another megabyte to a slot nobody will be
+    /// told about.
+    fn tick(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// When progress crosses the reporting step.
+    fn report(&mut self, stage: Stage, percent: u8) -> Result<(), Error>;
+}
+
+impl<F> Progress for F
+where
+    F: FnMut(Stage, u8) -> Result<(), Error>,
+{
+    fn report(&mut self, stage: Stage, percent: u8) -> Result<(), Error> {
+        self(stage, percent)
+    }
+}
+
 pub trait ImageSink {
     fn write(&mut self, chunk: &[u8]) -> Result<(), Error>;
 
@@ -60,7 +94,7 @@ pub fn install<H, S, P>(
 where
     H: HttpStream,
     S: ImageSink,
-    P: FnMut(Stage, u8) -> Result<(), Error>,
+    P: Progress,
 {
     let Some((url, _uuid)) = update.actionable() else {
         return Err(Error::Download("update has no firmware url".into()));
@@ -92,7 +126,7 @@ fn download<H, S, P>(
 where
     H: HttpStream,
     S: ImageSink,
-    P: FnMut(Stage, u8) -> Result<(), Error>,
+    P: Progress,
 {
     let content_length = http.open(url)?;
 
@@ -117,6 +151,12 @@ where
         sink.write(chunk)?;
         written += read as u64;
 
+        // Between chunks rather than between progress reports: reporting is
+        // throttled to a few dozen times across a whole image, and a heartbeat
+        // that arrives a few dozen times across ninety seconds is not a
+        // heartbeat.
+        on_progress.tick()?;
+
         if let Some(total) = expected_size {
             // A server that sends more than it promised is not something to
             // keep writing into a flash partition.
@@ -127,7 +167,7 @@ where
             }
 
             if let Some(percent) = throttle.take(written, total) {
-                on_progress(Stage::Downloading, percent)?;
+                on_progress.report(Stage::Downloading, percent)?;
             }
         }
     }
