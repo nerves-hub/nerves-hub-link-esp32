@@ -47,6 +47,8 @@ pub mod agent;
 pub mod checksum;
 pub mod config;
 pub mod error;
+pub mod extensions;
+pub mod health;
 pub mod esp;
 pub mod http;
 pub mod identity;

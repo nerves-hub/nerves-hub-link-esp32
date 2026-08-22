@@ -32,6 +32,14 @@ embuild = { version = "0.33", features = ["espidf"] }
 [features]
 default = []
 
+# Report cpu_usage_percent. Off by default because it is only meaningful with
+# FreeRTOS run-time statistics, which cost a timer and per-task bookkeeping and
+# must also be turned on in sdkconfig:
+#
+#   CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+#   CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+cpu-metrics = []
+
 [profile.release]
 opt-level = "s"
 
