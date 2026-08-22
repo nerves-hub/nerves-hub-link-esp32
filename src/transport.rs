@@ -29,9 +29,11 @@
 
 #![cfg(target_os = "espidf")]
 
+use std::mem::ManuallyDrop;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::io::EspIOError;
 use esp_idf_svc::tls::X509;
 use esp_idf_svc::ws::client::{
@@ -54,9 +56,41 @@ enum Incoming {
 }
 
 pub struct WebSocketTransport {
-    client: EspWebSocketClient<'static>,
+    client: ManuallyDrop<EspWebSocketClient<'static>>,
     incoming: Receiver<Incoming>,
     recv_timeout: Duration,
+}
+
+impl Drop for WebSocketTransport {
+    fn drop(&mut self) {
+        // esp-idf-svc 0.52.1 drops a client with `close().unwrap()` followed by
+        // `destroy().unwrap()`, and `esp_websocket_client_close` refuses two
+        // cases outright:
+        //
+        //     if (!client->run) { "Client was not started"; return ESP_FAIL; }
+        //     if (running_task == client->task_handle) { ...; return ESP_FAIL; }
+        //
+        // The first is every socket the server closed -- the client stops
+        // itself, so `run` is false by the time anything drops it. The unwrap
+        // then aborts the device. That is the whole of "Reconnect brings the
+        // device back slower than Reboot does": reconnecting meant panicking
+        // and cold-booting, paying for WiFi association and an SNTP sync on
+        // top of a restart.
+        //
+        // `esp_websocket_client_destroy` is the one to call. It stops a running
+        // client itself (`stop_wait_task`) and frees everything, and it has no
+        // opinion about a client that already stopped -- so it covers both
+        // cases that `close` refuses.
+        //
+        // Skipping the wrapper's Drop leaks its boxed event callback, which
+        // holds one channel sender: tens of bytes per reconnect, against a
+        // device that otherwise reboots on every one. It stops being necessary
+        // when upstream stops unwrapping.
+        log::debug!("closing the websocket");
+        unsafe {
+            esp_idf_svc::sys::esp_websocket_client_destroy(self.client.handle());
+        }
+    }
 }
 
 
@@ -133,7 +167,7 @@ impl WebSocketTransport {
         }
 
         Ok(Self {
-            client,
+            client: ManuallyDrop::new(client),
             incoming: rx,
             recv_timeout: Duration::from_millis(500),
         })
