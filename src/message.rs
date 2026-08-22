@@ -61,6 +61,22 @@ pub mod event {
 
     /// Device -> server: about to reboot.
     pub const REBOOTING: &str = "rebooting";
+
+    /// Server -> device: restart now. Sent when an operator presses Reboot.
+    pub const REBOOT: &str = "reboot";
+
+    /// Server -> device: make yourself known. Sent when an operator presses
+    /// Identify, so that someone standing in front of a shelf of identical
+    /// boxes can tell which one they are looking at.
+    pub const IDENTIFY: &str = "identify";
+
+    // There is no `reconnect` constant, and that is not an omission.
+    // NervesHub's third device command is served by closing the socket rather
+    // than by sending anything: the platform broadcasts to the socket's own
+    // `device_socket:<id>` topic and Phoenix drops the connection. The device
+    // finds out the same way it finds out about a flaky access point, and
+    // reconnects through the usual backoff -- so supporting it means having a
+    // reconnect loop that works, which the network already required.
 }
 
 #[derive(Debug, Clone, PartialEq)]

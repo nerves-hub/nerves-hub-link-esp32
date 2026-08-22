@@ -77,6 +77,7 @@ pub struct Agent<P, H> {
     handler: H,
     location: Option<Box<dyn LocationProvider>>,
     health: Option<Box<dyn HealthProvider>>,
+    identify: Option<Box<dyn FnMut()>>,
 }
 
 impl<P: Platform, H: UpdateHandler> Agent<P, H> {
@@ -84,6 +85,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         Self {
             location: None,
             health: None,
+            identify: None,
             config,
             metadata,
             platform,
@@ -99,6 +101,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             platform: self.platform,
             location: self.location,
             health: self.health,
+            identify: self.identify,
             handler,
         }
     }
@@ -115,6 +118,25 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
     /// Answer `health:check` with this.
     pub fn with_health(mut self, provider: impl HealthProvider + 'static) -> Self {
         self.health = Some(Box::new(provider));
+        self
+    }
+
+    /// Make the device identifiable to someone standing next to it.
+    ///
+    /// Run when an operator presses Identify in NervesHub, which they press
+    /// because they are looking at several identical boxes and need to know
+    /// which one the browser is pointed at. Blink an LED, sound something,
+    /// print to the console -- whatever is visible from where the device is.
+    ///
+    /// It runs on the session loop, so a long one delays heartbeats and
+    /// everything else: keep it to a few seconds, and hand anything longer to
+    /// a task.
+    ///
+    /// Without one, Identify is accepted and does nothing. That is not a
+    /// failure the platform can see -- it has no reply -- so a device that
+    /// should be identifiable needs this set.
+    pub fn on_identify(mut self, identify: impl FnMut() + 'static) -> Self {
+        self.identify = Some(Box::new(identify));
         self
     }
 
@@ -228,6 +250,20 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                         return Ok(Some(Stopped::Rebooting));
                     }
                 }
+                Ok(Action::Reboot) => {
+                    // Answered before restarting, not after: the socket is
+                    // about to go, and a reboot the operator asked for should
+                    // not be indistinguishable from a device that fell off the
+                    // network on its own.
+                    link.send_rebooting(transport)?;
+                    self.platform.restart();
+                    return Ok(Some(Stopped::Rebooting));
+                }
+                Ok(Action::Identify) => {
+                    if let Some(identify) = self.identify.as_mut() {
+                        identify();
+                    }
+                }
                 Ok(Action::Reconnect) => return Ok(None),
                 Ok(Action::Extension(needs)) => {
                     self.answer_extension(&mut link, transport, needs)?;
@@ -288,6 +324,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         match outcome {
             Ok(()) => {
                 link.send_progress(transport, Stage::Updating, 100)?;
+
+                // The image is written to the inactive slot and the bootloader
+                // is pointed at it: downloaded and applied, which is what
+                // `completed` claims. It is not a claim that the image works --
+                // nothing has run it yet. That comes after the reboot, from
+                // `firmware_validated`, and the two are deliberately separate:
+                // an update that completes and then rolls back has to be
+                // distinguishable from one that completes and stays.
+                link.send_status(transport, "completed", serde_json::json!({}))?;
+
                 link.send_rebooting(transport)?;
                 self.platform.restart();
                 Ok(true)

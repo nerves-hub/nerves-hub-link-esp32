@@ -44,6 +44,10 @@ pub enum Action {
     None,
     /// Download and apply this image, then reboot.
     ApplyUpdate(Box<UpdatePayload>),
+    /// An operator pressed Reboot. Say so, then restart.
+    Reboot,
+    /// An operator pressed Identify. Blink something.
+    Identify,
     /// The server closed or errored the channel; reconnect.
     Reconnect,
 }
@@ -197,6 +201,8 @@ impl Link {
                 let payload = UpdatePayload::parse(&message.payload)?;
                 self.decide(transport, handler, payload)
             }
+            event::REBOOT => Ok(Action::Reboot),
+            event::IDENTIFY => Ok(Action::Identify),
             event::CLOSE | event::ERROR => {
                 self.joined = false;
                 self.extensions.disconnected();
@@ -540,6 +546,49 @@ mod tests {
             }
             other => panic!("expected an update, got {other:?}"),
         }
+    }
+
+    // The two commands NervesHub pushes at a device. `reconnect` is absent on
+    // purpose -- see the note in `message::event`.
+    #[test]
+    fn a_reboot_request_is_acted_on() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_join(&mut transport).unwrap();
+
+        let frame = r#"[null,null,"device","reboot",{}]"#;
+
+        assert_eq!(
+            link.handle_frame(&mut transport, &mut AlwaysApply, frame).unwrap(),
+            Action::Reboot
+        );
+    }
+
+    #[test]
+    fn an_identify_request_is_acted_on() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_join(&mut transport).unwrap();
+
+        let frame = r#"[null,null,"device","identify",{}]"#;
+
+        assert_eq!(
+            link.handle_frame(&mut transport, &mut AlwaysApply, frame).unwrap(),
+            Action::Identify
+        );
+    }
+
+    // `completed` says the image is written and the bootloader points at it.
+    // The server records it against the inflight update, so the status has to
+    // be exactly this string.
+    #[test]
+    fn a_completed_status_names_the_status_the_server_records() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_join(&mut transport).unwrap();
+        link.send_status(&mut transport, "completed", json!({})).unwrap();
+
+        let sent = transport.last();
+        assert_eq!(sent.topic, "device");
+        assert_eq!(sent.event, "status_update");
+        assert_eq!(sent.payload["status"], "completed");
     }
 
     #[test]
