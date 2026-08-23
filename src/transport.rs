@@ -131,6 +131,19 @@ impl WebSocketTransport {
             client_cert,
             client_key,
             server_cert: config.server_ca.map(X509::pem),
+
+            // esp-tls refuses to set up at all with no verification option:
+            // "No server verification option set in esp_tls_cfg_t structure",
+            // and then the client never connects. A named CA wins where there
+            // is one; otherwise the roots ESP-IDF bundles, which is what any
+            // public host needs and what CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is
+            // turned on for.
+            crt_bundle_attach: if config.server_ca.is_some() {
+                None
+            } else {
+                Some(esp_idf_svc::sys::esp_crt_bundle_attach)
+            },
+
             headers: headers.as_deref(),
 
             // Phoenix has its own heartbeat on the "phoenix" topic; this is the
@@ -156,9 +169,24 @@ impl WebSocketTransport {
         // handshake completes is not a recoverable error in esp-idf-svc — it
         // panics. So this does not return until there is a connection, and a
         // handshake that never completes becomes a retryable error.
+        //
+        // Wrapped before the wait rather than after it. On the timeout path
+        // below the raw client would otherwise go out of scope and run
+        // esp-idf-svc's Drop, which unwraps a close that fails on a client
+        // that never connected, and aborts the device. A refused connection
+        // has to stay a retryable error: as a panic it is a boot loop, and the
+        // device never gets far enough to be told anything.
+        let client = ManuallyDrop::new(client);
+
         let deadline = Instant::now() + timeout;
         while !client.is_connected() {
             if Instant::now() >= deadline {
+                // Destroyed rather than dropped, for the reason in `Drop`
+                // above: `destroy` covers the cases `close` refuses.
+                unsafe {
+                    esp_idf_svc::sys::esp_websocket_client_destroy(client.handle());
+                }
+
                 return Err(Error::Transport(
                     "timed out waiting for the WebSocket handshake".into(),
                 ));
@@ -167,7 +195,7 @@ impl WebSocketTransport {
         }
 
         Ok(Self {
-            client: ManuallyDrop::new(client),
+            client,
             incoming: rx,
             recv_timeout: Duration::from_millis(500),
         })
