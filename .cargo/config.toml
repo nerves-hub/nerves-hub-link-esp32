@@ -11,7 +11,7 @@ rustflags = ["--cfg", "espidf_time64"]
 
 [env]
 # Read by esp-idf-sys when building for an espidf target; ignored on the host.
-ESP_IDF_VERSION = "v5.2.3"
+ESP_IDF_VERSION = "v5.5.5"
 
 # Device builds need -Zbuild-std (the esp toolchain ships no prebuilt std for
 # the espidf targets). That flag cannot go in [unstable] — it would apply to

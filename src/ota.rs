@@ -74,8 +74,8 @@ pub fn classify(first_byte: u8) -> Payload {
 /// Streams an image into the inactive OTA slot.
 ///
 /// Calls `esp_ota_*` directly rather than using the `esp-ota` crate: no
-/// published version of it works with `esp-idf-svc` 0.52 (it requires
-/// `esp-idf-sys` ^0.36, which conflicts with the 0.37 that `esp-idf-svc` pulls,
+/// published version of it works with `esp-idf-svc` 0.53 (it requires
+/// `esp-idf-sys` ^0.36, which conflicts with the 0.38 that `esp-idf-svc` pulls,
 /// and `esp-idf-sys` is a `links` crate so only one copy may exist). The C API
 /// is six functions, which is less to maintain than a pinned-back stack.
 ///

@@ -29,11 +29,9 @@
 
 #![cfg(target_os = "espidf")]
 
-use std::mem::ManuallyDrop;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::io::EspIOError;
 use esp_idf_svc::tls::X509;
 use esp_idf_svc::ws::client::{
@@ -56,43 +54,25 @@ enum Incoming {
 }
 
 pub struct WebSocketTransport {
-    client: ManuallyDrop<EspWebSocketClient<'static>>,
+    client: EspWebSocketClient<'static>,
     incoming: Receiver<Incoming>,
     recv_timeout: Duration,
 }
 
 impl Drop for WebSocketTransport {
     fn drop(&mut self) {
-        // esp-idf-svc 0.52.1 drops a client with `close().unwrap()` followed by
-        // `destroy().unwrap()`, and `esp_websocket_client_close` refuses two
-        // cases outright:
-        //
-        //     if (!client->run) { "Client was not started"; return ESP_FAIL; }
-        //     if (running_task == client->task_handle) { ...; return ESP_FAIL; }
-        //
-        // The first is every socket the server closed -- the client stops
-        // itself, so `run` is false by the time anything drops it. The unwrap
-        // then aborts the device. That is the whole of "Reconnect brings the
-        // device back slower than Reboot does": reconnecting meant panicking
-        // and cold-booting, paying for WiFi association and an SNTP sync on
-        // top of a restart.
-        //
-        // `esp_websocket_client_destroy` is the one to call. It stops a running
-        // client itself (`stop_wait_task`) and frees everything, and it has no
-        // opinion about a client that already stopped -- so it covers both
-        // cases that `close` refuses.
-        //
-        // Skipping the wrapper's Drop leaks its boxed event callback, which
-        // holds one channel sender: tens of bytes per reconnect, against a
-        // device that otherwise reboots on every one. It stops being necessary
-        // when upstream stops unwrapping.
+        // The client's own Drop closes and destroys it. Until esp-idf-svc 0.53
+        // it unwrapped both, and `esp_websocket_client_close` refuses a client
+        // that is no longer running, which is every socket the server closed,
+        // so dropping one aborted the device. This transport used to skip that
+        // Drop and call `esp_websocket_client_destroy` itself, which leaked
+        // the client's boxed event callback and, through the sender it holds,
+        // the channel behind it: a few hundred bytes on every reconnect.
+        // 0.53 logs a failed close or destroy instead of unwrapping it, so the
+        // client is now simply dropped, and everything it holds with it.
         log::debug!("closing the websocket");
-        unsafe {
-            esp_idf_svc::sys::esp_websocket_client_destroy(self.client.handle());
-        }
     }
 }
-
 
 impl WebSocketTransport {
     pub fn connect(config: &Config) -> Result<Self, Error> {
@@ -180,23 +160,13 @@ impl WebSocketTransport {
         // panics. So this does not return until there is a connection, and a
         // handshake that never completes becomes a retryable error.
         //
-        // Wrapped before the wait rather than after it. On the timeout path
-        // below the raw client would otherwise go out of scope and run
-        // esp-idf-svc's Drop, which unwraps a close that fails on a client
-        // that never connected, and aborts the device. A refused connection
-        // has to stay a retryable error: as a panic it is a boot loop, and the
-        // device never gets far enough to be told anything.
-        let client = ManuallyDrop::new(client);
-
+        // On that path the client is dropped. Its close fails on a client that
+        // never connected, which esp-idf-svc 0.53 logs before destroying it;
+        // earlier versions unwrapped it and aborted the device, turning a
+        // refused connection into a boot loop.
         let deadline = Instant::now() + timeout;
         while !client.is_connected() {
             if Instant::now() >= deadline {
-                // Destroyed rather than dropped, for the reason in `Drop`
-                // above: `destroy` covers the cases `close` refuses.
-                unsafe {
-                    esp_idf_svc::sys::esp_websocket_client_destroy(client.handle());
-                }
-
                 return Err(Error::Transport(
                     "timed out waiting for the WebSocket handshake".into(),
                 ));
