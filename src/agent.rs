@@ -654,7 +654,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                     self.answer_extension(&mut link, transport, needs)?;
                 }
                 Ok(Action::None) => {}
-                Err(_) => return Ok(None),
+                // Said out loud: a message that cannot be handled ends the
+                // session, and a session that ends without a word looks exactly
+                // like a flaky network.
+                Err(err) => {
+                    log::warn!(
+                        "could not handle a {}-byte message from NervesHub ({err}); reconnecting",
+                        frame.len()
+                    );
+                    return Ok(None);
+                }
             }
         }
     }

@@ -152,6 +152,16 @@ impl WebSocketTransport {
             // alive server-side.
             ping_interval_sec: Duration::from_secs(config.heartbeat_interval_secs),
 
+            // A frame larger than the client's buffer (1 KiB by default)
+            // arrives as several DATA events, and `esp-idf-svc` hands each one
+            // on as a text frame of its own, without the offsets that would put
+            // them back together. An `update` from NervesCloud, whose firmware
+            // URL carries a signed query string, is a little over 1 KiB, so its
+            // pieces each failed to parse and the session silently restarted
+            // instead of updating. Every message NervesHub sends a device fits
+            // in this.
+            buffer_size: 4096,
+
             ..Default::default()
         };
 
