@@ -24,7 +24,7 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # using those through it keeps the whole esp-rs stack on one consistent version
 # instead of three that have to be kept in step by hand.
 [target.'cfg(target_os = "espidf")'.dependencies]
-esp-idf-svc = { version = "0.52", features = ["binstart"] }
+esp-idf-svc = { version = "0.53", features = ["binstart"] }
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

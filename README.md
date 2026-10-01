@@ -21,7 +21,7 @@ bootloader's rollback protection intact.
 | Checksums | ✅ |
 | Install orchestration (download → verify → commit) | ✅ |
 | Delta updates (`esp_delta_ota`) | ✅ |
-| WebSocket transport (`esp_websocket_client`) | Run on hardware, over `ws://` and shared secrets |
+| WebSocket transport (`esp_websocket_client`) | Run on hardware with shared secrets: over `ws://` on the ESP32 bench, and over `wss://` to NervesCloud on an ESP32-C6 |
 | HTTP download (`EspHttpConnection`) | ✅ |
 | `esp_ota` apply, rollback confirmation | ✅ |
 | Extensions: health, geo, logging | ✅ |
@@ -32,7 +32,7 @@ bootloader's rollback protection intact.
 
 ## Requirements
 
-- ESP-IDF, via `esp-idf-svc` (std). The `no_std` `esp-hal` stack is not
+- ESP-IDF v5.3 or later, via `esp-idf-svc` 0.53 (std); CI builds against v5.5.5. The `no_std` `esp-hal` stack is not
   supported: it brings no ESP-IDF, and therefore no `esp_ota`, no
   `esp_websocket_client`, and no mbedTLS.
 - Two app partitions plus `otadata`. See `partitions.csv`.
@@ -319,8 +319,8 @@ into the image gives an entire fleet one identity.
 
 `ota.rs` calls the six `esp_ota_*` C functions directly rather than using the
 `esp-ota` crate. No published version of `esp-ota` works with `esp-idf-svc`
-0.52: the newest (0.2.2) requires `esp-idf-sys` `^0.36`, `esp-idf-svc` 0.52
-pulls `0.37`, and `esp-idf-sys` is a `links = "esp_idf"` crate so only one copy
+0.53: the newest (0.2.2) requires `esp-idf-sys` `^0.36`, `esp-idf-svc` 0.53
+pulls `0.38`, and `esp-idf-sys` is a `links = "esp_idf"` crate so only one copy
 may exist in the graph. Pinning the whole stack back to keep a thin wrapper was
 the worse trade.
 
