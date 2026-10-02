@@ -85,9 +85,9 @@ pub fn memory_metrics(
 /// Worth reporting because it distinguishes the reboots that are fine — a power
 /// cycle, an OTA — from the ones that are not: a panic, a watchdog, a brownout.
 /// A fleet quietly brownout-resetting looks identical to a healthy one in every
-/// other metric.
+/// other metric. A power glitch or a CPU lockup belongs on the same list.
 pub fn reset_reason_name(reason: u32) -> &'static str {
-    // esp_reset_reason_t, from esp_system.h.
+    // esp_reset_reason_t, from esp_system.h (ESP-IDF v5.5).
     match reason {
         0 => "unknown",
         1 => "power_on",
@@ -100,6 +100,14 @@ pub fn reset_reason_name(reason: u32) -> &'static str {
         8 => "deep_sleep",
         9 => "brownout",
         10 => "sdio",
+        // The reset espflash and esptool give a chip after flashing it over
+        // its USB-Serial-JTAG port, so the first boot of most new firmware.
+        11 => "usb",
+        12 => "jtag",
+        13 => "efuse",
+        14 => "power_glitch",
+        // A double exception: the CPU could no longer handle exceptions at all.
+        15 => "cpu_lockup",
         _ => "unrecognised",
     }
 }
@@ -257,5 +265,17 @@ mod tests {
         assert_eq!(reset_reason_name(6), "task_watchdog");
         assert_eq!(reset_reason_name(9), "brownout");
         assert_eq!(reset_reason_name(255), "unrecognised");
+    }
+
+    // ESP-IDF 5.x appended these. Unnamed, a device flashed over USB reported
+    // its first boot as "unrecognised", and so would a power glitch.
+    #[test]
+    fn reset_reasons_added_in_esp_idf_5_are_named() {
+        assert_eq!(reset_reason_name(11), "usb");
+        assert_eq!(reset_reason_name(12), "jtag");
+        assert_eq!(reset_reason_name(13), "efuse");
+        assert_eq!(reset_reason_name(14), "power_glitch");
+        assert_eq!(reset_reason_name(15), "cpu_lockup");
+        assert_eq!(reset_reason_name(16), "unrecognised");
     }
 }
