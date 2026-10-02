@@ -13,6 +13,10 @@ license = "Apache-2.0"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The msgpack serializer (`vsn=3.0.0`). Pure Rust, and it writes a
+# `serde_json::Value` as msgpack directly, so payloads keep one representation
+# whichever serializer carries them.
+rmp-serde = "1.3"
 sha2 = "0.10"
 
 # Shared-secret authentication. Pure Rust rather than mbedTLS so the token

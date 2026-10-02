@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use crate::error::Error;
 use crate::extensions::Enabled;
 use crate::shared_secret::SharedSecret;
-use crate::message::{DEVICE_API_VERSION, SERIALIZER_VSN};
+use crate::message::{Serializer, DEVICE_API_VERSION};
 use crate::tls_session::TlsSession;
 
 /// How the device proves who it is.
@@ -124,6 +124,10 @@ pub struct Config {
     /// resumes across reconnects within a boot; a device that sleeps restores
     /// it from RTC memory. See [`TlsSession`].
     pub tls_session: TlsSession,
+    /// How messages are written on the socket. JSON unless asked otherwise;
+    /// msgpack is smaller and needs a NervesHub from July 2026 or later. See
+    /// [`Serializer`].
+    pub serializer: Serializer,
 }
 
 impl Config {
@@ -141,10 +145,11 @@ impl Config {
             progress_step_percent: 5,
             extensions: Enabled::none(),
             tls_session: TlsSession::new(),
+            serializer: Serializer::Json,
         }
     }
 
-    /// The socket URL, including the `vsn` that selects the JSON serializer.
+    /// The socket URL, including the `vsn` that selects the serializer.
     pub fn socket_url(&self) -> String {
         let scheme = if self.use_tls { "wss" } else { "ws" };
         format!("{}://{}:{}{}", scheme, self.host, self.port, self.socket_path())
@@ -152,7 +157,7 @@ impl Config {
 
     /// The path the websocket upgrade asks for, query and all.
     pub fn socket_path(&self) -> String {
-        format!("/device-socket/websocket?vsn={}", SERIALIZER_VSN)
+        format!("/device-socket/websocket?vsn={}", self.serializer.vsn())
     }
 
     pub fn backoff_for(&self, attempt: usize) -> u64 {
@@ -226,6 +231,17 @@ mod tests {
     #[test]
     fn socket_path_keeps_the_serializer_query() {
         assert_eq!(config().socket_path(), "/device-socket/websocket?vsn=2.0.0");
+    }
+
+    #[test]
+    fn socket_url_asks_for_msgpack_when_configured() {
+        let mut config = config();
+        config.serializer = Serializer::MsgPack;
+
+        assert_eq!(
+            config.socket_url(),
+            "wss://devices.nerves-hub.org:443/device-socket/websocket?vsn=3.0.0"
+        );
     }
 
     #[test]
