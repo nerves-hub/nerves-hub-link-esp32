@@ -186,6 +186,39 @@ gone. Nothing is read during one, and nothing needs to be: frames arriving
 queue on the transport and are handled when it finishes, so a console command
 typed mid-update is answered late rather than lost.
 
+## Devices that sleep
+
+`run` holds the connection for as long as the device is up, and returns only
+to reboot into an update. A battery device can't do that: it wakes, reports,
+and sleeps again. `run_session` is one connection, bounded:
+
+```rust
+use nerves_hub_link_esp32::{SessionWindow, Stopped};
+use std::time::Duration;
+
+let window = SessionWindow {
+    // Stay at least this long after the join, for an update or a console.
+    linger: Duration::from_secs(10),
+    // Leave by this, whatever is still queued. An update that has started
+    // installing always finishes.
+    limit: Duration::from_secs(90),
+};
+
+match esp::agent_with(config, policy)?.with_health(health).run_session(window) {
+    Ok(Stopped::Finished) => {}          // reported; go back to sleep
+    Ok(Stopped::Rebooting) => {}         // an update, or an operator's reboot
+    Err(err) => log::warn!("{err}"),     // no retry: that's the caller's call
+}
+```
+
+Inside the window it does everything `run` does in a session: the running
+image is confirmed once the join is accepted, extensions attach, updates
+install. It leaves once the join is `linger` old and nothing is outstanding --
+the extensions channel answered, the health check NervesHub sends on attach
+answered, the queued log sent -- or at `limit`. Nothing is retried: a refused
+connection, or a session the server ends early, is an `Error::Transport`,
+because only the application knows what another attempt costs its battery.
+
 ## Project setup
 
 Five things, none of which this crate can do for you.

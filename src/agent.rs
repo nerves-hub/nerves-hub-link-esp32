@@ -85,6 +85,40 @@ const LOG_SEND_INTERVAL_MS: u64 = 250;
 pub enum Stopped {
     /// An update was applied and the device is rebooting into it.
     Rebooting,
+    /// A bounded session ran its course: see [`Agent::run_session`]. Never
+    /// returned by [`Agent::run`].
+    Finished,
+}
+
+/// How long one session lasts, for a device that sleeps between them.
+///
+/// A battery device cannot hold a socket open: it wakes, reports, and sleeps
+/// again, and NervesHub sees it arrive and leave. What it must not do is leave
+/// before the platform has had its say, and the platform speaks *after* the
+/// join -- the update decision comes back on the join reply or shortly after
+/// it, the health extension asks for a report as soon as it attaches, and the
+/// log only drains a line at a time. Hence two bounds rather than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionWindow {
+    /// Stay at least this long after the join, so that an update pushed just
+    /// after it, or an operator opening the console, has a device to reach.
+    pub linger: Duration,
+    /// Leave this long after connecting whatever is still pending -- queued
+    /// log lines, an unanswered extension -- because a device that waits for
+    /// everything waits forever on a server that has gone quiet.
+    ///
+    /// An update that has started installing is the exception. It runs to the
+    /// end, since abandoning it only means downloading it again next time.
+    pub limit: Duration,
+}
+
+impl Default for SessionWindow {
+    fn default() -> Self {
+        Self {
+            linger: Duration::from_secs(10),
+            limit: Duration::from_secs(60),
+        }
+    }
 }
 
 /// A NervesHub device agent.
@@ -517,6 +551,36 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         }
     }
 
+    /// Connect once, do what NervesHub asks inside `window`, and return.
+    ///
+    /// For a device that sleeps between reports. Everything [`Agent::run`]
+    /// does in a session happens here too -- the running image is confirmed
+    /// once the join is accepted, extensions attach, updates install and
+    /// reboot -- but nothing is retried: a connection that fails, or a session
+    /// the server ends early, comes back as [`Error::Transport`], and trying
+    /// again is the caller's decision, because only the caller knows what
+    /// another attempt costs its battery.
+    ///
+    /// Returns [`Stopped::Finished`] once the join is at least
+    /// [`SessionWindow::linger`] old and nothing is outstanding -- the
+    /// extensions channel answered, a health check answered if one came, the
+    /// queued log sent -- or at [`SessionWindow::limit`], whichever is first.
+    /// Returns [`Stopped::Rebooting`] after an update, as `run` does.
+    pub fn run_session(&mut self, window: SessionWindow) -> Result<Stopped, Error> {
+        let mut transport = self.platform.connect(&self.config)?;
+        let mut joined = false;
+
+        match self.session_within(&mut transport, &mut joined, Some(window))? {
+            Some(stopped) => Ok(stopped),
+            // The socket closed or the server asked for a reconnect. `run`
+            // would come straight back; a bounded session reports it, and the
+            // join state says whether anything got through first.
+            None => Err(Error::Transport(format!(
+                "session ended by the connection (joined: {joined})"
+            ))),
+        }
+    }
+
     /// One connection's lifetime. `None` means reconnect.
     ///
     /// `joined` is set once the platform accepts the join, which is what tells
@@ -525,6 +589,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         &mut self,
         transport: &mut P::Transport,
         joined: &mut bool,
+    ) -> Result<Option<Stopped>, Error> {
+        self.session_within(transport, joined, None)
+    }
+
+    /// A session, ending at the window if there is one.
+    fn session_within(
+        &mut self,
+        transport: &mut P::Transport,
+        joined: &mut bool,
+        window: Option<SessionWindow>,
     ) -> Result<Option<Stopped>, Error> {
         let mut link = Link::new(self.config.clone(), self.metadata.clone());
 
@@ -555,9 +629,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         let mut last_heartbeat = self.platform.now_ms();
         let heartbeat_ms = self.config.heartbeat_interval_secs * 1_000;
 
+        // Only read with a window. The clock starts at the join having been
+        // sent, which is as near to "connected" as this function sees.
+        let started = self.platform.now_ms();
+        let mut joined_at: Option<u64> = None;
+        let mut health_answered = false;
+
         loop {
             if link.joined() && !confirmed {
                 *joined = true;
+                joined_at = Some(self.platform.now_ms());
                 self.confirm_running_image(&mut link, transport)?;
                 confirmed = true;
             }
@@ -609,6 +690,30 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
             }
 
+            // Checked between frames, never inside one: an update runs inside
+            // `apply` below and so always finishes, however long it takes.
+            if let Some(window) = window {
+                if now.saturating_sub(started) >= window.limit.as_millis() as u64 {
+                    // A session that never joined did nothing the platform can
+                    // see, which the caller needs to tell apart from one that
+                    // reported and merely left something queued.
+                    if !link.joined() {
+                        return Err(Error::Transport(
+                            "no join reply inside the session limit".into(),
+                        ));
+                    }
+
+                    return Ok(Some(Stopped::Finished));
+                }
+
+                let lingered = joined_at
+                    .is_some_and(|at| now.saturating_sub(at) >= window.linger.as_millis() as u64);
+
+                if lingered && self.nothing_outstanding(&link, health_answered) {
+                    return Ok(Some(Stopped::Finished));
+                }
+            }
+
             let frame = match transport.recv() {
                 Ok(Some(frame)) => frame,
                 Ok(None) => continue,
@@ -651,6 +756,10 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
                 Ok(Action::Reconnect) => return Ok(None),
                 Ok(Action::Extension(needs)) => {
+                    if needs.contains(&Outgoing::NeedHealth) {
+                        health_answered = true;
+                    }
+
                     self.answer_extension(&mut link, transport, needs)?;
                 }
                 Ok(Action::None) => {}
@@ -666,6 +775,29 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
             }
         }
+    }
+
+    /// Whether a bounded session has anything left to wait for.
+    ///
+    /// Each condition only counts when the platform took part in it. An
+    /// extension the product does not have, a log nobody attached, a health
+    /// check with no provider to answer it: none of those will ever complete,
+    /// and waiting on them would turn every session into one that runs to its
+    /// limit.
+    fn nothing_outstanding(&self, link: &Link, health_answered: bool) -> bool {
+        let extensions = !link.extensions_wanted() || link.extensions_joined();
+
+        // The platform asks for a report as soon as health attaches, so a
+        // session that leaves before answering has spent its connection and
+        // left the device's chart empty for another interval.
+        let health = self.health.is_none()
+            || !link.attached_extensions().iter().any(|key| key == crate::extensions::HEALTH)
+            || health_answered;
+
+        let logs = !link.logging_attached()
+            || self.logs.as_ref().map_or(true, |logs| logs.is_empty());
+
+        extensions && health && logs
     }
 
     /// Tell NervesHub the running image is good, and cancel any rollback.
@@ -1598,6 +1730,187 @@ mod tests {
         assert_eq!(shared.borrow().commits, 0);
         assert_eq!(shared.borrow().restarts, 0);
         assert!(events(&shared).contains(&"status_update".to_string()));
+    }
+
+    /// `n` half-seconds of nothing, which is what a quiet socket looks like.
+    fn quiet(n: usize) -> Vec<Incoming> {
+        (0..n).map(|_| Ok(None)).collect()
+    }
+
+    fn window(linger_ms: u64, limit_ms: u64) -> SessionWindow {
+        SessionWindow {
+            linger: Duration::from_millis(linger_ms),
+            limit: Duration::from_millis(limit_ms),
+        }
+    }
+
+    struct FakeHealth;
+
+    impl HealthProvider for FakeHealth {
+        fn report(&mut self) -> crate::extensions::HealthReport {
+            crate::extensions::HealthReport::default().metric("tank_level_mm", 1200.0)
+        }
+    }
+
+    fn health_attached() -> Incoming {
+        // Ref 3: join(1), firmware_validated(2), then the extensions join.
+        Ok(Some(
+            r#"["3","3","extensions","phx_reply",{"status":"ok","response":["health"]}]"#
+                .to_string(),
+        ))
+    }
+
+    fn health_check() -> Incoming {
+        Ok(Some(r#"[null,null,"extensions","health:check",{}]"#.to_string()))
+    }
+
+    // The point of a bounded session: it comes back, where `run` never does,
+    // and it has confirmed the image on the way, exactly as `run` would.
+    #[test]
+    fn a_bounded_session_leaves_once_it_has_lingered() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(5_000));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat);
+
+        assert_eq!(agent.run_session(window(100, 10_000)).unwrap(), Stopped::Finished);
+
+        // Stayed for the linger, and not for the limit.
+        assert!(agent.platform.clock_ms >= 100, "left after {}ms", agent.platform.clock_ms);
+        assert!(agent.platform.clock_ms < 1_000, "stayed {}ms", agent.platform.clock_ms);
+
+        assert_eq!(shared.borrow().connects, 1);
+        assert!(shared.borrow().slept.is_empty(), "a bounded session never backs off");
+        assert!(events(&shared).contains(&"firmware_validated".to_string()));
+    }
+
+    // Health attaches after the join and the platform asks for a report straight
+    // away. A session that leaves at the linger without answering has paid for
+    // its connection and left the chart empty for another interval.
+    #[test]
+    fn a_bounded_session_waits_for_the_health_check() {
+        let mut frames = vec![
+            join_reply(json!({"update_available": false})),
+            health_attached(),
+        ];
+        // Arrives well after the linger has run out.
+        frames.extend(quiet(200));
+        frames.push(health_check());
+        frames.extend(quiet(5_000));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().health();
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+
+        assert_eq!(agent.run_session(window(5, 10_000)).unwrap(), Stopped::Finished);
+
+        let sent = shared.borrow().sent.clone();
+        let report = sent.iter().find(|f| f.contains("health:report")).expect("no report sent");
+        assert!(report.contains("tank_level_mm"));
+    }
+
+    // The platform may never ask. A check that does not come, a log that never
+    // drains because something keeps writing to it: the limit is what stops a
+    // session running until the battery does.
+    #[test]
+    fn a_bounded_session_leaves_at_its_limit_whatever_is_outstanding() {
+        let mut frames = vec![
+            join_reply(json!({"update_available": false})),
+            health_attached(),
+        ];
+        frames.extend(quiet(5_000));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().health();
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+
+        // Ran out of time rather than out of frames, which would be an error.
+        assert_eq!(agent.run_session(window(5, 1_000)).unwrap(), Stopped::Finished);
+        assert!(agent.platform.clock_ms >= 1_000);
+        assert!(!shared.borrow().sent.iter().any(|f| f.contains("health:report")));
+    }
+
+    // Leaving without a join is a failed report, not a finished one, and the
+    // caller decides on a retry from exactly that difference.
+    #[test]
+    fn a_bounded_session_that_never_joins_is_an_error() {
+        let plat = platform(vec![quiet(5_000)]);
+
+        let mut agent = agent(plat);
+
+        match agent.run_session(window(10, 500)) {
+            Err(Error::Transport(reason)) => assert!(reason.contains("join"), "{reason}"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+    }
+
+    // Retrying costs a battery device a radio that stays on. That is the
+    // application's trade to make, so a refused connection comes straight back.
+    #[test]
+    fn a_bounded_session_does_not_retry_a_failed_connect() {
+        let mut plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
+        plat.connect_failures = 1;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat);
+
+        assert!(matches!(agent.run_session(window(10, 500)), Err(Error::Transport(_))));
+        assert_eq!(shared.borrow().connects, 1);
+        assert!(shared.borrow().slept.is_empty());
+    }
+
+    // The session limit is a bound on waiting, not on working. Cutting an
+    // install short only means downloading the whole image again next time.
+    #[test]
+    fn an_update_runs_past_the_session_limit() {
+        let image = vec![7u8; 4096 * 12];
+
+        let update = json!({
+            "update_available": true,
+            "firmware_url": "https://example.test/fw.bin",
+            "firmware_meta": {"uuid": "uuid-1"},
+            "size": image.len(),
+            "checksum": sha256_upper(&image)
+        });
+
+        let mut plat = platform(vec![vec![join_reply(update)]]);
+        plat.image = image;
+        // Twelve chunks at half a second each: well past the limit below.
+        plat.clock_step_ms = 500;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat);
+
+        assert_eq!(agent.run_session(window(10, 2_000)).unwrap(), Stopped::Rebooting);
+        assert!(agent.platform.clock_ms > 2_000);
+        assert_eq!(shared.borrow().commits, 1);
+        assert_eq!(shared.borrow().restarts, 1);
+    }
+
+    // A server that closes the socket after the join still got the join, and
+    // the error says so, because "reported, then dropped" and "never reached
+    // it" are different problems in the field.
+    #[test]
+    fn a_bounded_session_cut_short_says_whether_it_joined() {
+        let plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
+
+        let mut agent = agent(plat);
+
+        match agent.run_session(window(10_000, 60_000)) {
+            Err(Error::Transport(reason)) => assert!(reason.contains("joined: true"), "{reason}"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
     }
 
     #[test]
