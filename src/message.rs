@@ -79,6 +79,12 @@ pub mod event {
     /// boxes can tell which one they are looking at.
     pub const IDENTIFY: &str = "identify";
 
+    /// Server -> device: join the extensions channel, and which versions of
+    /// each extension the platform has. Sent once the device is joined, to a
+    /// device declaring API 2.2.0 or later; NervesHub before 2.x named no
+    /// versions.
+    pub const EXTENSIONS_GET: &str = "extensions:get";
+
     /// Device -> server: console output.
     pub const UP: &str = "up";
 

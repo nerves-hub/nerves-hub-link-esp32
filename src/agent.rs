@@ -73,12 +73,36 @@ pub trait Platform {
     fn now_ms(&mut self) -> u64;
 }
 
-/// How long to wait between log lines.
+/// How long to wait between log lines, sent one per message.
 ///
-/// NervesHub allows five a second per device and drops the rest without
-/// telling the device, so this stays under it with room to spare. A backlog
-/// drains slowly, which is the intended trade: late beats discarded.
+/// NervesHub allows five messages a second per device and drops the rest
+/// without telling the device, so this stays under it with room to spare. A
+/// backlog drains slowly, which is the intended trade: late beats discarded.
 const LOG_SEND_INTERVAL_MS: u64 = 250;
+
+/// How long to wait between batches, under logging 0.1.0.
+///
+/// A second's worth per message is what NervesHub's batched logging is built
+/// around. A device that has just connected sends its whole backlog in the
+/// first, which for a device that sleeps between reports is usually all of it.
+const LOG_BATCH_INTERVAL_MS: u64 = 1_000;
+
+/// The most lines a batch carries: NervesHub stores the first hundred of a
+/// message and drops the rest.
+const LOG_BATCH_MAX_LINES: usize = 100;
+
+/// Roughly the most JSON a batch carries. The websocket client's buffer is
+/// 4 KiB, and a message larger than it goes out as fragments, so a batch stays
+/// inside one with room for the Phoenix envelope and escaping.
+const LOG_BATCH_MAX_BYTES: usize = 3_000;
+
+/// How long after the join to wait for `extensions:get` before joining the
+/// extensions channel uninvited, at the oldest versions.
+///
+/// Every NervesHub with extensions sends it to a device declaring API 2.2.0,
+/// straight after the join reply, so this is a fallback rather than a wait
+/// anyone sees.
+const EXTENSIONS_INVITATION_WAIT_MS: u64 = 5_000;
 
 /// Why the loop stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,10 +667,18 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 confirmed = true;
             }
 
-            // Only after the device channel is joined: the platform decides
-            // what to attach from the device's product, which it knows once the
-            // device has said who it is.
-            if link.joined() && link.extensions_wanted() && !extensions_joined {
+            // When the platform asks, which it does once the device channel is
+            // joined: it decides what to attach from the device's product,
+            // which it knows once the device has said who it is, and the
+            // invitation says which versions it has.
+            let invitation_overdue = joined_at.is_some_and(|at| {
+                self.platform.now_ms().saturating_sub(at) >= EXTENSIONS_INVITATION_WAIT_MS
+            });
+            if link.joined()
+                && link.extensions_wanted()
+                && !extensions_joined
+                && (link.extensions_invited() || invitation_overdue)
+            {
                 link.send_extensions_join(transport)?;
                 extensions_joined = true;
             }
@@ -675,20 +707,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 last_heartbeat = now;
             }
 
-            // One line per interval, and only once the platform has attached
-            // logging -- popping before then would discard the line into a
-            // channel nothing is listening on.
-            if link.logging_attached() && now.saturating_sub(last_log) >= LOG_SEND_INTERVAL_MS {
-                let pending = self
-                    .logs
-                    .as_ref()
-                    .and_then(|logs| logs.pop_stamped(crate::logging::unix_micros()));
-
-                if let Some(line) = pending {
-                    link.send_log(transport, &line)?;
-                    last_log = now;
-                }
-            }
+            send_logs(&mut link, transport, self.logs.as_deref(), now, &mut last_log)?;
 
             // Checked between frames, never inside one: an update runs inside
             // `apply` below and so always finishes, however long it takes.
@@ -946,6 +965,41 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
 /// heartbeat that cannot be sent, on the other hand, is how the download learns
 /// the connection has gone -- the error abandons it rather than writing the
 /// rest of an image nobody will hear about.
+/// Send what the log buffer holds, at the pace the attached logging version
+/// allows: a batch a second at 0.1.0, a line every quarter second at 0.0.1.
+///
+/// Only once the platform has attached logging -- taking lines before then
+/// would discard them into a channel nothing is listening on.
+fn send_logs<T: Transport>(
+    link: &mut Link,
+    transport: &mut T,
+    logs: Option<&LogBuffer>,
+    now: u64,
+    last_log: &mut u64,
+) -> Result<(), Error> {
+    let Some(logs) = logs else { return Ok(()) };
+    if !link.logging_attached() {
+        return Ok(());
+    }
+
+    let (interval, max_lines) = if link.logging_batched() {
+        (LOG_BATCH_INTERVAL_MS, LOG_BATCH_MAX_LINES)
+    } else {
+        (LOG_SEND_INTERVAL_MS, 1)
+    };
+    if now.saturating_sub(*last_log) < interval {
+        return Ok(());
+    }
+
+    let lines = logs.take_stamped(max_lines, LOG_BATCH_MAX_BYTES, crate::logging::unix_micros());
+    if !lines.is_empty() {
+        link.send_logs(transport, &lines)?;
+        *last_log = now;
+    }
+
+    Ok(())
+}
+
 struct Pump<'a, P: Platform, H: UpdateHandler> {
     link: &'a mut Link,
     transport: &'a mut P::Transport,
@@ -966,17 +1020,7 @@ impl<P: Platform, H: UpdateHandler> crate::install::Progress for Pump<'_, P, H> 
             self.last_heartbeat = now;
         }
 
-        if self.link.logging_attached() && now.saturating_sub(self.last_log) >= LOG_SEND_INTERVAL_MS
-        {
-            let pending = self
-                .logs
-                .and_then(|logs| logs.pop_stamped(crate::logging::unix_micros()));
-
-            if let Some(line) = pending {
-                self.link.send_log(self.transport, &line)?;
-                self.last_log = now;
-            }
-        }
+        send_logs(&mut *self.link, &mut *self.transport, self.logs.map(|logs| &**logs), now, &mut self.last_log)?;
 
         Ok(())
     }
@@ -1168,6 +1212,15 @@ mod tests {
         Ok(Some(format!(
             r#"["1","1","device","phx_reply",{{"status":"ok","response":{}}}]"#,
             response
+        )))
+    }
+
+    /// NervesHub's `extensions:get`, naming what it has, as it sends it once the
+    /// device is joined.
+    fn invitation(advertisement: Value) -> Incoming {
+        Ok(Some(format!(
+            r#"["1",null,"device","extensions:get",{{"extensions":{}}}]"#,
+            advertisement
         )))
     }
 
@@ -1503,6 +1556,7 @@ mod tests {
 
         let plat = platform(vec![vec![
             join_reply(json!({"update_available": false})),
+            invitation(json!({"health": ["0.0.1"]})),
             // The extensions join reply: the platform attached health. Ref 3
             // because references run join(1), firmware_validated(2), then this
             // join — and the reply is only accepted if the reference matches,
@@ -1794,6 +1848,7 @@ mod tests {
     fn a_bounded_session_waits_for_the_health_check() {
         let mut frames = vec![
             join_reply(json!({"update_available": false})),
+            invitation(json!({"health": ["0.0.1"]})),
             health_attached(),
         ];
         // Arrives well after the linger has run out.
@@ -1823,6 +1878,7 @@ mod tests {
     fn a_bounded_session_leaves_at_its_limit_whatever_is_outstanding() {
         let mut frames = vec![
             join_reply(json!({"update_available": false})),
+            invitation(json!({"health": ["0.0.1"]})),
             health_attached(),
         ];
         frames.extend(quiet(5_000));
@@ -1921,5 +1977,90 @@ mod tests {
             checksum: "AA".into(),
         };
         assert_eq!(report.bytes, 1);
+    }
+
+    // The join waits for the platform to ask, because the invitation is what
+    // says which versions it has.
+    #[test]
+    fn extensions_wait_for_the_invitation() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(100));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().health();
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+        let _ = agent.run_session(window(5, 50));
+
+        assert!(!shared.borrow().sent.iter().any(|f| f.contains("\"extensions\"")));
+    }
+
+    // But not forever: a platform that never asks still gets the join the
+    // device always sent, at the versions every NervesHub has.
+    #[test]
+    fn an_invitation_that_never_comes_still_joins() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(10_000));
+
+        let mut plat = platform(vec![frames]);
+        plat.clock_step_ms = 10;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().health();
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+        let _ = agent.run_session(window(5, 20_000));
+
+        let sent = shared.borrow().sent.clone();
+        let join = sent
+            .iter()
+            .find(|f| f.contains("\"extensions\"") && f.contains("phx_join"))
+            .expect("never joined");
+        assert!(join.contains(r#"{"health":"0.0.1"}"#), "{join}");
+    }
+
+    // The point of logging 0.1.0: what a sleeping device queued since its last
+    // report goes as one message, not one per line.
+    #[test]
+    fn queued_lines_go_as_one_batch_under_logging_0_1_0() {
+        let logs = Arc::new(LogBuffer::new(16));
+        for message in ["one", "two", "three"] {
+            logs.push(crate::extensions::LogLine::new("info", message));
+        }
+
+        let mut frames = vec![
+            join_reply(json!({"update_available": false})),
+            invitation(json!({"logging": ["0.1.0", "0.0.1"]})),
+            Ok(Some(
+                r#"["3","3","extensions","phx_reply",{"status":"ok","response":["logging"]}]"#
+                    .to_string(),
+            )),
+        ];
+        frames.extend(quiet(5_000));
+
+        let mut plat = platform(vec![frames]);
+        plat.clock_step_ms = 10;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().logging();
+
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_logs(Arc::clone(&logs));
+        assert_eq!(agent.run_session(window(5, 20_000)).unwrap(), Stopped::Finished);
+
+        let sent = shared.borrow().sent.clone();
+        let join = sent.iter().find(|f| f.contains("\"extensions\"") && f.contains("phx_join")).unwrap();
+        assert!(join.contains(r#"{"logging":"0.1.0"}"#), "{join}");
+
+        let batches: Vec<&String> = sent.iter().filter(|f| f.contains("logging:send")).collect();
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        for message in ["one", "two", "three"] {
+            assert!(batches[0].contains(message), "{}", batches[0]);
+        }
+        assert!(logs.is_empty());
     }
 }

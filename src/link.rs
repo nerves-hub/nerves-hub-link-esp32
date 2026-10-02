@@ -223,6 +223,12 @@ impl Link {
             }
             event::REBOOT => Ok(Action::Reboot),
             event::IDENTIFY => Ok(Action::Identify),
+            // Joined by the agent's loop, which has the clock that decides
+            // what an invitation that never comes means.
+            event::EXTENSIONS_GET => {
+                self.extensions.on_invitation(&message.payload);
+                Ok(Action::None)
+            }
             event::CLOSE | event::ERROR => {
                 self.joined = false;
                 self.extensions.disconnected();
@@ -336,6 +342,16 @@ impl Link {
         self.extensions.joined()
     }
 
+    /// Whether the platform has sent `extensions:get`.
+    pub fn extensions_invited(&self) -> bool {
+        self.extensions.invited()
+    }
+
+    /// Whether log lines go as batches rather than one at a time.
+    pub fn logging_batched(&self) -> bool {
+        self.extensions.logging_batched()
+    }
+
     /// Whether the platform attached logging, which is the only state in which
     /// sending a line does anything.
     pub fn logging_attached(&self) -> bool {
@@ -394,6 +410,17 @@ impl Link {
         line: &LogLine,
     ) -> Result<(), Error> {
         let outgoing = self.extensions.log(line);
+        self.send_extension(transport, outgoing)
+    }
+
+    /// Send log lines, batched if the attached version batches, if the
+    /// logging extension is attached.
+    pub fn send_logs<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        lines: &[LogLine],
+    ) -> Result<(), Error> {
+        let outgoing = self.extensions.logs(lines);
         self.send_extension(transport, outgoing)
     }
 
