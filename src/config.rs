@@ -102,6 +102,15 @@ pub struct Config {
     pub device_api_version: String,
     /// Phoenix heartbeat interval. Must stay under the server's socket timeout.
     pub heartbeat_interval_secs: u64,
+    /// How long a connection has to come up: DNS, TCP, the TLS handshake and
+    /// the websocket upgrade, end to end. Past it the attempt is abandoned as
+    /// a transport error.
+    ///
+    /// Ten seconds is plenty on WiFi. It isn't over LTE-M: from an ESP32-S3,
+    /// the TLS handshake alone has been measured at 5.5 s and at 11.5 s on
+    /// consecutive boots, the difference all network. Cellular devices want
+    /// something like 30.
+    pub connect_timeout_secs: u64,
     /// Reconnect backoff, in seconds, walked in order then repeating the last.
     pub reconnect_backoff_secs: Vec<u64>,
     /// Report download progress every N percent.
@@ -121,6 +130,7 @@ impl Config {
             device_api_version: DEVICE_API_VERSION.to_string(),
             use_tls: true,
             heartbeat_interval_secs: 30,
+            connect_timeout_secs: 10,
             reconnect_backoff_secs: vec![1, 2, 5, 10, 30, 60],
             progress_step_percent: 5,
             extensions: Enabled::none(),
@@ -158,6 +168,13 @@ mod tests {
             "devices.nerves-hub.org",
             Credentials::client_certificate(b"cert-pem".to_vec(), b"key-pem".to_vec()).unwrap(),
         )
+    }
+
+    // The default is what this crate always used, so a WiFi device sees no
+    // change; only a device that asks for longer waits longer.
+    #[test]
+    fn the_connect_timeout_defaults_to_ten_seconds() {
+        assert_eq!(config().connect_timeout_secs, 10);
     }
 
     #[test]
