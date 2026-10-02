@@ -61,6 +61,18 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<rmp_serde::encode::Error> for Error {
+    fn from(err: rmp_serde::encode::Error) -> Self {
+        Error::Protocol(err.to_string())
+    }
+}
+
+impl From<rmp_serde::decode::Error> for Error {
+    fn from(err: rmp_serde::decode::Error) -> Self {
+        Error::Protocol(err.to_string())
+    }
+}
+
 /// The reason string sent to NervesHub with a `failed` status.
 ///
 /// It surfaces in the device's audit log and in the deployment's failure

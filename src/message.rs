@@ -1,9 +1,9 @@
 //! Phoenix Channels v2 wire format.
 //!
 //! NervesHub's device socket negotiates its serializer from the `vsn` query
-//! parameter: `2.0.0` selects JSON, `3.0.0` selects msgpack. We ask for JSON,
-//! which puts `Phoenix.Socket.V2.JSONSerializer` on the other end — a five
-//! element array rather than an object:
+//! parameter: `2.0.0` selects JSON, `3.0.0` selects msgpack (see
+//! [`Serializer`]). Either way a message is a five element array rather than
+//! an object:
 //!
 //! ```text
 //! [join_ref, ref, topic, event, payload]
@@ -12,6 +12,9 @@
 //! `join_ref` and `ref` are nullable, which is why both are `Option<String>`
 //! rather than being skipped: the array is positional, so a missing element
 //! shifts everything after it.
+//!
+//! JSON travels in text frames and msgpack in binary ones, in both directions;
+//! NervesHub's msgpack serializer refuses a text frame outright.
 //!
 //! # Topic
 //!
@@ -42,6 +45,53 @@ pub const CONTROL_TOPIC: &str = "phoenix";
 
 /// Selects `DeviceJSONSerializer` on the server.
 pub const SERIALIZER_VSN: &str = "2.0.0";
+
+/// Selects `DeviceMsgPackSerializer` on the server.
+pub const MSGPACK_SERIALIZER_VSN: &str = "3.0.0";
+
+/// How messages are written on the socket.
+///
+/// msgpack is smaller -- no quotes, colons or commas, one-byte headers for
+/// short strings and small numbers -- which matters on a link billed by the
+/// byte, and NervesHub has had it since July 2026. JSON is the default
+/// because every NervesHub has it, and because a frame you can read in a
+/// packet capture is worth something on a bench.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Serializer {
+    #[default]
+    Json,
+    MsgPack,
+}
+
+impl Serializer {
+    /// The `vsn` the socket URL asks for.
+    pub fn vsn(self) -> &'static str {
+        match self {
+            Serializer::Json => SERIALIZER_VSN,
+            Serializer::MsgPack => MSGPACK_SERIALIZER_VSN,
+        }
+    }
+}
+
+/// One websocket message: text for JSON, binary for msgpack.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl Frame {
+    pub fn len(&self) -> usize {
+        match self {
+            Frame::Text(text) => text.len(),
+            Frame::Binary(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// The device API version reported on join. NervesHub gates features on this —
 /// archives require `>= 2.0.0`, for example.
@@ -163,6 +213,51 @@ impl Message {
         })
     }
 
+    /// This message as `serializer` writes it.
+    pub fn encode_as(&self, serializer: Serializer) -> Result<Frame, crate::error::Error> {
+        Ok(match serializer {
+            Serializer::Json => Frame::Text(self.encode()?),
+            Serializer::MsgPack => Frame::Binary(self.encode_msgpack()?),
+        })
+    }
+
+    /// Read a frame, by what kind it is: text is JSON, binary is msgpack.
+    pub fn decode_frame(frame: &Frame) -> Result<Self, crate::error::Error> {
+        Ok(match frame {
+            Frame::Text(text) => Self::decode(text)?,
+            Frame::Binary(bytes) => Self::decode_msgpack(bytes)?,
+        })
+    }
+
+    pub fn encode_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        // A tuple, so an array; and `Value` maps as msgpack maps. (`to_vec`
+        // would write a Rust struct as an array of its fields, which is why
+        // nothing here is one.)
+        rmp_serde::to_vec(&(
+            &self.join_ref,
+            &self.reference,
+            &self.topic,
+            &self.event,
+            &self.payload,
+        ))
+    }
+
+    /// The refs are read leniently. NervesHub sends back the strings the
+    /// device sent, but msgpack lets another server send integers, and a ref
+    /// is only ever compared as text.
+    pub fn decode_msgpack(raw: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        let (join_ref, reference, topic, event, payload): (Value, Value, String, String, Value) =
+            rmp_serde::from_slice(raw)?;
+
+        Ok(Self {
+            join_ref: reference_text(join_ref),
+            reference: reference_text(reference),
+            topic,
+            event,
+            payload,
+        })
+    }
+
     /// `true` if this is a successful `phx_reply` to `reference`.
     pub fn is_ok_reply_to(&self, reference: &str) -> bool {
         self.event == event::REPLY
@@ -173,6 +268,14 @@ impl Message {
     /// The `response` body of a `phx_reply`, if there is one.
     pub fn reply_response(&self) -> Option<&Value> {
         self.payload.get("response")
+    }
+}
+
+fn reference_text(reference: Value) -> Option<String> {
+    match reference {
+        Value::Null => None,
+        Value::String(text) => Some(text),
+        other => Some(other.to_string()),
     }
 }
 
@@ -256,6 +359,69 @@ mod tests {
         let raw =
             r#"["1","1","device","phx_reply",{"status":"error","response":{"reason":"nope"}}]"#;
         assert!(!Message::decode(raw).unwrap().is_ok_reply_to("1"));
+    }
+
+    // What Msgpax writes for `[nil, nil, "device", "update", %{...}]`, the
+    // shape NervesHub's msgpack serializer pushes.
+    #[test]
+    fn decodes_a_msgpack_push_from_the_server() {
+        let raw = rmp_serde::to_vec(&(
+            None::<String>,
+            None::<String>,
+            "device",
+            "update",
+            json!({"update_available": true}),
+        ))
+        .unwrap();
+
+        let msg = Message::decode_frame(&Frame::Binary(raw)).unwrap();
+
+        assert_eq!(msg.event, event::UPDATE);
+        assert_eq!(msg.reference, None);
+        assert_eq!(msg.payload["update_available"], json!(true));
+    }
+
+    #[test]
+    fn msgpack_round_trips() {
+        let msg = Message::new(DEVICE_TOPIC, event::UPDATE_PROGRESS, json!({"value": 42, "f": 1.5}))
+            .with_refs(Some("1".into()), Some("9".into()));
+
+        let Frame::Binary(bytes) = msg.encode_as(Serializer::MsgPack).unwrap() else {
+            panic!("msgpack is binary")
+        };
+        assert_eq!(Message::decode_msgpack(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn integer_refs_read_as_text() {
+        let raw = rmp_serde::to_vec(&(1u8, 2u8, "device", "phx_reply", json!({"status": "ok"})))
+            .unwrap();
+
+        let msg = Message::decode_msgpack(&raw).unwrap();
+
+        assert!(msg.is_ok_reply_to("2"));
+        assert_eq!(msg.join_ref.as_deref(), Some("1"));
+    }
+
+    // The payload is a map whatever its keys, never an array of values: the
+    // server reads it by name.
+    #[test]
+    fn a_msgpack_payload_is_a_map() {
+        let bytes = Message::new(DEVICE_TOPIC, event::JOIN, json!({"a": 1}))
+            .encode_msgpack()
+            .unwrap();
+
+        // fixarray of 5, nil, nil, "device", "phx_join", then fixmap of 1.
+        assert_eq!(bytes[0], 0x95);
+        assert_eq!(bytes[bytes.len() - 4], 0x81);
+    }
+
+    #[test]
+    fn json_is_text_and_msgpack_is_binary() {
+        let msg = Message::new(CONTROL_TOPIC, event::HEARTBEAT, json!({}));
+
+        assert!(matches!(msg.encode_as(Serializer::Json).unwrap(), Frame::Text(_)));
+        assert!(matches!(msg.encode_as(Serializer::MsgPack).unwrap(), Frame::Binary(_)));
     }
 
     #[test]

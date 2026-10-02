@@ -70,6 +70,7 @@ pub use config::{Config, Credentials};
 pub use error::Error;
 pub use install::{install, HttpStream, ImageSink, InstallReport};
 pub use link::{Action, AlwaysApply, Link, Transport, UpdateHandler};
+pub use message::{Frame, Serializer};
 pub use metadata::FirmwareMetadata;
 pub use tls_session::{Handshake, TlsSession};
 pub use update::{Stage, UpdateDecision, UpdatePayload};

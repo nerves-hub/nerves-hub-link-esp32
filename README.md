@@ -376,6 +376,22 @@ failure that says nothing about a renamed key.
 In production, provision at manufacture and enable NVS encryption: the private
 key is otherwise readable by anyone who can dump flash.
 
+## msgpack
+
+NervesHub reads either JSON or msgpack from a device, chosen by the socket URL.
+JSON is the default because every NervesHub has it; msgpack, from July 2026,
+is smaller:
+
+```rust
+config.serializer = nerves_hub_link_esp32::Serializer::MsgPack;
+```
+
+On frames shaped like a cellular water monitor's it is 13% smaller on the
+join and 14% on a batch of log lines, but only 3% on a health report, whose
+floats take eight bytes either way: about 400 bytes a report in all.
+Worth having on a link billed by the byte; not worth more than one line of
+configuration.
+
 ## Authentication
 
 Both of NervesHub's schemes, as configuration on the same websocket client:

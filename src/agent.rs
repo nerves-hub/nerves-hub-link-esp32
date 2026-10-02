@@ -733,14 +733,14 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 }
             }
 
-            let frame = match transport.recv() {
+            let frame = match transport.recv_frame() {
                 Ok(Some(frame)) => frame,
                 Ok(None) => continue,
                 // The socket died. Not fatal — reconnect.
                 Err(_) => return Ok(None),
             };
 
-            match link.handle_frame(transport, &mut self.handler, &frame) {
+            match link.handle(transport, &mut self.handler, &frame) {
                 Ok(Action::ApplyUpdate(update)) => {
                     if self.apply(&mut link, transport, &update)? {
                         return Ok(Some(Stopped::Rebooting));

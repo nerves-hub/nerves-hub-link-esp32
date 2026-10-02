@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
 use crate::message::{CONSOLE_TOPIC, CONSOLE_VERSION};
-use crate::message::{event, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
+use crate::message::{event, Frame, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::metadata::{BootReport, FirmwareMetadata};
 use crate::update::{Stage, UpdateDecision, UpdatePayload};
 
@@ -20,6 +20,18 @@ pub trait Transport {
     fn send(&mut self, frame: &str) -> Result<(), Error>;
     /// `None` means nothing arrived before the timeout.
     fn recv(&mut self) -> Result<Option<String>, Error>;
+
+    /// A binary frame, which is how the msgpack serializer writes. A
+    /// transport that only carries text refuses it.
+    fn send_binary(&mut self, _frame: &[u8]) -> Result<(), Error> {
+        Err(Error::Transport("this transport carries text frames only".into()))
+    }
+
+    /// The next frame of either kind. For a transport that only carries
+    /// text, that is `recv`.
+    fn recv_frame(&mut self) -> Result<Option<Frame>, Error> {
+        Ok(self.recv()?.map(Frame::Text))
+    }
 }
 
 /// What the application must decide.
@@ -131,9 +143,7 @@ impl Link {
 
         // Heartbeats go to the "phoenix" topic and carry no join_ref.
         let message = Message::new(CONTROL_TOPIC, event::HEARTBEAT, json!({}));
-        let frame = message.with_refs(None, Some(reference)).encode()?;
-
-        transport.send(&frame)
+        self.write(transport, &message.with_refs(None, Some(reference)))
     }
 
     pub fn send_progress<T: Transport>(
@@ -205,8 +215,25 @@ impl Link {
         handler: &mut H,
         frame: &str,
     ) -> Result<Action, Error> {
-        let message = Message::decode(frame)?;
+        self.handle_message(transport, handler, Message::decode(frame)?)
+    }
 
+    /// Like [`handle_frame`](Self::handle_frame), for a frame of either kind.
+    pub fn handle<T: Transport, H: UpdateHandler>(
+        &mut self,
+        transport: &mut T,
+        handler: &mut H,
+        frame: &Frame,
+    ) -> Result<Action, Error> {
+        self.handle_message(transport, handler, Message::decode_frame(frame)?)
+    }
+
+    fn handle_message<T: Transport, H: UpdateHandler>(
+        &mut self,
+        transport: &mut T,
+        handler: &mut H,
+        message: Message,
+    ) -> Result<Action, Error> {
         if message.topic == EXTENSIONS_TOPIC {
             return self.handle_extension_frame(transport, &message);
         }
@@ -260,15 +287,14 @@ impl Link {
         // Not `send`, which stamps the *device* channel's join_ref on whatever
         // it is given. A join carries its own ref in both positions, and that
         // ref is what every later frame on the topic is labelled with.
-        let frame = Message::new(
+        let message = Message::new(
             CONSOLE_TOPIC,
             event::JOIN,
             json!({"console_version": CONSOLE_VERSION}),
         )
-        .with_refs(Some(reference.clone()), Some(reference))
-        .encode()?;
+        .with_refs(Some(reference.clone()), Some(reference));
 
-        transport.send(&frame)
+        self.write(transport, &message)
     }
 
     /// Write to the terminal.
@@ -286,7 +312,7 @@ impl Link {
         let message = Message::new(CONSOLE_TOPIC, event::UP, json!({"data": text}))
             .with_refs(self.console_join_ref.clone(), Some(reference));
 
-        transport.send(&message.encode()?)
+        self.write(transport, &message)
     }
 
     fn handle_console_frame<T: Transport>(
@@ -370,8 +396,7 @@ impl Link {
         let (reference, message) = self.extensions.join_message(&mut self.refs);
         self.extensions_join_ref = Some(reference.clone());
 
-        let frame = message.with_refs(Some(reference.clone()), Some(reference)).encode()?;
-        transport.send(&frame)
+        self.write(transport, &message.with_refs(Some(reference.clone()), Some(reference)))
     }
 
     /// Perform frames produced by the extensions state machine.
@@ -383,10 +408,9 @@ impl Link {
         for out in outgoing {
             if let Outgoing::Send { event, payload } = out {
                 let reference = self.refs.next_ref();
-                let frame = Message::new(EXTENSIONS_TOPIC, &event, payload)
-                    .with_refs(self.extensions_join_ref.clone(), Some(reference))
-                    .encode()?;
-                transport.send(&frame)?;
+                let message = Message::new(EXTENSIONS_TOPIC, &event, payload)
+                    .with_refs(self.extensions_join_ref.clone(), Some(reference));
+                self.write(transport, &message)?;
             }
         }
 
@@ -523,11 +547,16 @@ impl Link {
         message: Message,
         reference: Option<String>,
     ) -> Result<(), Error> {
-        let frame = message
-            .with_refs(self.join_ref.clone(), reference)
-            .encode()?;
+        self.write(transport, &message.with_refs(self.join_ref.clone(), reference))
+    }
 
-        transport.send(&frame)
+    /// Every frame goes out through here, in the serializer the socket URL
+    /// asked for: the server reads nothing else on that socket.
+    fn write<T: Transport>(&self, transport: &mut T, message: &Message) -> Result<(), Error> {
+        match message.encode_as(self.config.serializer)? {
+            Frame::Text(text) => transport.send(&text),
+            Frame::Binary(bytes) => transport.send_binary(&bytes),
+        }
     }
 }
 
@@ -654,6 +683,67 @@ mod tests {
         let action = link
             .handle_frame(&mut transport, &mut AlwaysApply, frame)
             .unwrap();
+
+        assert!(link.joined());
+        assert_eq!(action, Action::None);
+    }
+
+    /// Only binary: a msgpack link that wrote text would be refused by the
+    /// server's serializer, which reads binary frames and nothing else.
+    #[derive(Default)]
+    struct BinaryTransport {
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl Transport for BinaryTransport {
+        fn send(&mut self, frame: &str) -> Result<(), Error> {
+            panic!("a msgpack link sent text: {frame}")
+        }
+
+        fn recv(&mut self) -> Result<Option<String>, Error> {
+            Ok(None)
+        }
+
+        fn send_binary(&mut self, frame: &[u8]) -> Result<(), Error> {
+            self.sent.push(frame.to_vec());
+            Ok(())
+        }
+    }
+
+    fn msgpack_link() -> Link {
+        let mut link = link();
+        link.config.serializer = crate::message::Serializer::MsgPack;
+        link
+    }
+
+    #[test]
+    fn a_msgpack_link_writes_binary_frames() {
+        let (mut link, mut transport) = (msgpack_link(), BinaryTransport::default());
+
+        link.send_join(&mut transport, BootReport::default()).unwrap();
+        link.send_heartbeat(&mut transport).unwrap();
+
+        let join = Message::decode_msgpack(&transport.sent[0]).unwrap();
+        assert_eq!((join.topic.as_str(), join.event.as_str()), (DEVICE_TOPIC, event::JOIN));
+        let heartbeat = Message::decode_msgpack(&transport.sent[1]).unwrap();
+        assert_eq!(heartbeat.event, event::HEARTBEAT);
+    }
+
+    #[test]
+    fn a_msgpack_join_reply_marks_the_link_joined() {
+        let (mut link, mut transport) = (msgpack_link(), BinaryTransport::default());
+        link.send_join(&mut transport, BootReport::default()).unwrap();
+
+        let reply = Message::new(
+            DEVICE_TOPIC,
+            event::REPLY,
+            json!({"status": "ok", "response": {"update_available": false}}),
+        )
+        .with_refs(Some("1".into()), Some("1".into()))
+        .encode_msgpack()
+        .unwrap();
+
+        let action = link.handle(&mut transport, &mut AlwaysApply, &Frame::Binary(reply)).unwrap();
 
         assert!(link.joined());
         assert_eq!(action, Action::None);
