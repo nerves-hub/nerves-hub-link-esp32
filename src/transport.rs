@@ -1,5 +1,15 @@
 //! WebSocket transport over ESP-IDF's `esp_websocket_client`.
 //!
+//! # Why the C client directly
+//!
+//! `esp-idf-svc` wraps the same client, but builds its transports itself, and
+//! the TLS one it builds keeps its session where nothing can save it across a
+//! deep sleep. The C client takes a transport from outside (`ext_transport`),
+//! so this hands it a websocket transport over [`crate::tls`], whose session
+//! lives in [`Config::tls_session`](crate::Config::tls_session). The rest is
+//! what `esp-idf-svc` did: start the client, turn its events into frames, and
+//! close and destroy it on drop.
+//!
 //! # Who owns reconnection
 //!
 //! The agent does. A socket that comes back without a `phx_join` on it carries
@@ -29,19 +39,19 @@
 
 #![cfg(target_os = "espidf")]
 
+use core::ffi::{c_int, c_void};
+use std::ffi::CString;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use esp_idf_svc::io::EspIOError;
-use esp_idf_svc::tls::X509;
-use esp_idf_svc::ws::client::{
-    EspWebSocketClient, EspWebSocketClientConfig, WebSocketEvent, WebSocketEventType,
-};
-use esp_idf_svc::ws::FrameType;
+use esp_idf_svc::hal::delay::TickType;
+use esp_idf_svc::sys;
 
 use crate::config::{Config, Credentials};
 use crate::error::Error;
 use crate::link::Transport;
+use crate::tls;
 
 /// What the client's callback hands to the run loop.
 ///
@@ -54,23 +64,50 @@ enum Incoming {
 }
 
 pub struct WebSocketTransport {
-    client: EspWebSocketClient<'static>,
+    client: sys::esp_websocket_client_handle_t,
+    // The client runs over these but does not own them: an `ext_transport` is
+    // the caller's to destroy, and only once the client has stopped using it.
+    // `base` is the TLS (or TCP) transport `ws` sits on.
+    ws: sys::esp_transport_handle_t,
+    base: sys::esp_transport_handle_t,
+    /// For a `base` that is [`crate::tls`]'s rather than ESP-IDF's TCP
+    /// transport.
+    stopper: Option<tls::Stopper>,
+    events: *mut Events,
     incoming: Receiver<Incoming>,
     recv_timeout: Duration,
+    send_timeout: sys::TickType_t,
 }
+
+// The handles are only used from the thread that owns the transport; the
+// client's own task reaches `events` through the pointer it was given, and
+// `Events` is a Mutex.
+unsafe impl Send for WebSocketTransport {}
 
 impl Drop for WebSocketTransport {
     fn drop(&mut self) {
-        // The client's own Drop closes and destroys it. Until esp-idf-svc 0.53
-        // it unwrapped both, and `esp_websocket_client_close` refuses a client
-        // that is no longer running, which is every socket the server closed,
-        // so dropping one aborted the device. This transport used to skip that
-        // Drop and call `esp_websocket_client_destroy` itself, which leaked
-        // the client's boxed event callback and, through the sender it holds,
-        // the channel behind it: a few hundred bytes on every reconnect.
-        // 0.53 logs a failed close or destroy instead of unwrapping it, so the
-        // client is now simply dropped, and everything it holds with it.
-        log::debug!("closing the websocket");
+        unsafe {
+            // No close frame. The client's close would send one, take the
+            // server's, then wait for the server to close TCP by asking the
+            // transport under it for its socket -- which only ESP-IDF's own
+            // transports can answer, so it sits out a full second for nothing.
+            // NervesHub treats every disconnect alike, and dropping the
+            // connection is what a device losing signal does anyway; leaving
+            // it out saves a round trip and two frames.
+            //
+            // Destroying stops the client's task, which closes the connection
+            // on its way out, after which no event can arrive, so `events` and
+            // the transports under it can go. `stop` lets the task notice in a
+            // tenth of a second rather than at its next one-second poll.
+            if let Some(stopper) = &self.stopper {
+                stopper.stop();
+            }
+            sys::esp_websocket_client_destroy(self.client);
+            sys::esp_transport_destroy(self.ws);
+            sys::esp_transport_destroy(self.base);
+            drop(Box::from_raw(self.events));
+        }
+        log::debug!("closed the websocket");
     }
 }
 
@@ -81,15 +118,14 @@ impl WebSocketTransport {
         // Both authentication modes are just configuration on the same client:
         // a certificate mbedTLS presents during the handshake, or headers sent
         // with the HTTP upgrade. Which an organization uses is its choice.
-        let (client_cert, client_key, headers) = match &config.credentials {
+        let (client_certificate, headers) = match &config.credentials {
             Credentials::ClientCertificate {
                 certificate,
                 private_key,
             } => (
                 // Presented to NervesHub, which resolves it to a device via
                 // NervesHub.Devices.Certificates.get_device_by_x509/1.
-                Some(X509::pem(certificate)),
-                Some(X509::pem(private_key)),
+                Some((*certificate, *private_key)),
                 None,
             ),
             Credentials::SharedSecret { identifier, secret } => {
@@ -103,78 +139,100 @@ impl WebSocketTransport {
                     .map(|(name, value)| format!("{name}: {value}\r\n"))
                     .collect::<String>();
 
-                (None, None, Some(block))
+                (None, Some(block))
             }
         };
 
         let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
 
-        let ws_config = EspWebSocketClientConfig {
-            client_cert,
-            client_key,
-            server_cert: config.server_ca.map(X509::pem),
+        // From the first handle on, every early return has to give back what
+        // was made before it; `Partial` does, until `Self` takes over.
+        let mut partial = Partial::default();
 
-            // esp-tls refuses to set up at all with no verification option:
-            // "No server verification option set in esp_tls_cfg_t structure",
-            // and then the client never connects. A named CA wins where there
-            // is one; otherwise the roots ESP-IDF bundles, which is what any
-            // public host needs and what CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is
-            // turned on for.
-            crt_bundle_attach: if config.server_ca.is_some() {
-                None
-            } else {
-                Some(esp_idf_svc::sys::esp_crt_bundle_attach)
-            },
+        let stopper = if config.use_tls {
+            let (base, stopper) = tls::transport(tls::Settings {
+                server_ca: config.server_ca,
+                client_certificate,
+                session: config.tls_session.clone(),
+            })?;
+            partial.base = base;
+            Some(stopper)
+        } else {
+            partial.base = nonnull(unsafe { sys::esp_transport_tcp_init() }, "TCP transport")?;
+            None
+        };
+        partial.ws = nonnull(unsafe { sys::esp_transport_ws_init(partial.base) }, "websocket transport")?;
 
-            headers: headers.as_deref(),
+        // Which the client would otherwise set on a transport it made itself.
+        // The ws transport copies each string, so these need only outlive the
+        // call.
+        let path = cstring(config.socket_path())?;
+        let headers = headers.map(cstring).transpose()?;
+        let ws_config = sys::esp_transport_ws_config_t {
+            ws_path: path.as_ptr(),
+            headers: headers.as_ref().map_or(core::ptr::null(), |h| h.as_ptr()),
+            // As the client asks of its own transports: it answers pings and
+            // sees the server's close itself, so it wants every frame.
+            propagate_control_frames: true,
+            ..Default::default()
+        };
+        esp(unsafe { sys::esp_transport_ws_set_config(partial.ws, &ws_config) })?;
+
+        let uri = cstring(config.socket_url())?;
+        let client_config = sys::esp_websocket_client_config_t {
+            uri: uri.as_ptr(),
+            ext_transport: partial.ws,
 
             // Phoenix has its own heartbeat on the "phoenix" topic; this is the
             // transport-level one. Both are wanted — the transport ping detects
             // a dead TCP connection, the Phoenix heartbeat keeps the channel
             // alive server-side.
-            ping_interval_sec: Duration::from_secs(config.heartbeat_interval_secs),
+            ping_interval_sec: config.heartbeat_interval_secs as _,
 
-            // A frame larger than the client's buffer (1 KiB by default)
-            // arrives as several DATA events, and `esp-idf-svc` hands each one
-            // on as a text frame of its own, without the offsets that would put
-            // them back together. An `update` from NervesCloud, whose firmware
-            // URL carries a signed query string, is a little over 1 KiB, so its
-            // pieces each failed to parse and the session silently restarted
-            // instead of updating. Every message NervesHub sends a device fits
-            // in this.
+            // Frames bigger than the buffer arrive in pieces, which `Events`
+            // puts back together, so this is about how many pieces rather than
+            // whether a message survives. Every message NervesHub sends a
+            // device -- the largest, an `update` with a signed firmware URL, is
+            // a little over 1 KiB -- fits in one.
             buffer_size: 4096,
 
             // The IDF client's own bound on connecting -- DNS, TCP, TLS --
             // which it otherwise defaults to 10 s, too short for a TLS
             // handshake over a slow cellular link. See
             // `Config::connect_timeout_secs`.
-            network_timeout_ms: connect_timeout,
+            network_timeout_ms: connect_timeout.as_millis() as _,
 
             ..Default::default()
         };
 
-        // Bounds each send and the close, not the connect.
-        let send_timeout = Duration::from_secs(10);
+        partial.client = unsafe { sys::esp_websocket_client_init(&client_config) };
+        if partial.client.is_null() {
+            return Err(Error::Transport("could not create the websocket client".into()));
+        }
 
-        let client =
-            EspWebSocketClient::new(&config.socket_url(), &ws_config, send_timeout, move |event| {
-                handle_event(&tx, event);
-            })
-            .map_err(|e: EspIOError| Error::Transport(e.to_string()))?;
+        partial.events = Box::into_raw(Box::new(Events::new(tx)));
+        esp(unsafe {
+            sys::esp_websocket_register_events(
+                partial.client,
+                sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY,
+                Some(on_event),
+                partial.events.cast(),
+            )
+        })?;
+        esp(unsafe { sys::esp_websocket_client_start(partial.client) })?;
+
+        // Bounds each send and the close, not the connect.
+        let send_timeout: TickType = Duration::from_secs(10).into();
+        let transport = partial.into_transport(rx, send_timeout.0, stopper);
 
         // The IDF client performs the handshake on its own task, so getting a
         // client back says nothing about the socket being up. The run loop
-        // sends the join as soon as this returns, and sending before the
-        // handshake completes is not a recoverable error in esp-idf-svc — it
-        // panics. So this does not return until there is a connection, and a
-        // handshake that never completes becomes a retryable error.
-        //
-        // On that path the client is dropped. Its close fails on a client that
-        // never connected, which esp-idf-svc 0.53 logs before destroying it;
-        // earlier versions unwrapped it and aborted the device, turning a
-        // refused connection into a boot loop.
+        // sends the join as soon as this returns, so this does not return until
+        // there is a connection, and a handshake that never completes becomes a
+        // retryable error. Dropping `transport` on that path closes (which
+        // fails, harmlessly, on a client that never connected) and destroys it.
         let deadline = Instant::now() + connect_timeout;
-        while !client.is_connected() {
+        while !transport.is_connected() {
             if Instant::now() >= deadline {
                 return Err(Error::Transport(
                     "timed out waiting for the WebSocket handshake".into(),
@@ -183,58 +241,217 @@ impl WebSocketTransport {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        Ok(Self {
-            client,
-            incoming: rx,
-            recv_timeout: Duration::from_millis(500),
-        })
+        if config.use_tls {
+            match config.tls_session.last_handshake() {
+                Some(crate::Handshake::Resumed) => log::info!("TLS session resumed"),
+                Some(crate::Handshake::Full) => log::info!("TLS full handshake"),
+                None => {}
+            }
+        }
+
+        Ok(transport)
     }
 
     pub fn is_connected(&self) -> bool {
-        self.client.is_connected()
+        unsafe { sys::esp_websocket_client_is_connected(self.client) }
     }
 }
 
-// Text frames and the end of the socket are the run loop's business; pings,
-// pongs, and the handshake are the transport's own. Binary is ignored because
-// Phoenix only ever sends text on this socket.
-//
-// Forwarding the close is the whole point of this function. Without it the
-// channel stays open with nothing ever arriving on it, `recv` reports an idle
-// socket forever, and the agent waits out the rest of its life for a frame
-// from a connection that ended.
-//
-// An `Err` is the client's ERROR event, and it is deliberately *not* one of
-// those. The IDF client raises it for anything it dislikes, including during a
-// normal connect, and a device that abandoned the session on each one never
-// got as far as joining. A genuine failure is followed by a close, so waiting
-// for the close costs nothing and reads far more of what is happening.
-fn handle_event(tx: &Sender<Incoming>, event: &Result<WebSocketEvent<'_>, EspIOError>) {
-    let Ok(event) = event else {
-        log::debug!("websocket error event");
-        return;
-    };
+/// The pieces of a transport not yet assembled, released in reverse if
+/// assembly stops partway.
+struct Partial {
+    client: sys::esp_websocket_client_handle_t,
+    ws: sys::esp_transport_handle_t,
+    base: sys::esp_transport_handle_t,
+    events: *mut Events,
+}
 
-    match event.event_type {
-        WebSocketEventType::Text(text) => {
-            let _ = tx.send(Incoming::Text(text.to_string()));
+impl Default for Partial {
+    fn default() -> Self {
+        Self {
+            client: core::ptr::null_mut(),
+            ws: core::ptr::null_mut(),
+            base: core::ptr::null_mut(),
+            events: core::ptr::null_mut(),
         }
-        WebSocketEventType::Disconnected
-        | WebSocketEventType::Close(_)
-        | WebSocketEventType::Closed => {
-            let _ = tx.send(Incoming::Closed);
+    }
+}
+
+impl Partial {
+    fn into_transport(
+        self,
+        incoming: Receiver<Incoming>,
+        send_timeout: sys::TickType_t,
+        stopper: Option<tls::Stopper>,
+    ) -> WebSocketTransport {
+        let this = core::mem::ManuallyDrop::new(self);
+        WebSocketTransport {
+            client: this.client,
+            ws: this.ws,
+            base: this.base,
+            stopper,
+            events: this.events,
+            incoming,
+            recv_timeout: Duration::from_millis(500),
+            send_timeout,
+        }
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.client.is_null() {
+                sys::esp_websocket_client_destroy(self.client);
+            }
+            if !self.ws.is_null() {
+                sys::esp_transport_destroy(self.ws);
+            }
+            if !self.base.is_null() {
+                sys::esp_transport_destroy(self.base);
+            }
+            if !self.events.is_null() {
+                drop(Box::from_raw(self.events));
+            }
+        }
+    }
+}
+
+fn nonnull(
+    handle: sys::esp_transport_handle_t,
+    what: &str,
+) -> Result<sys::esp_transport_handle_t, Error> {
+    if handle.is_null() {
+        Err(Error::Transport(format!("no memory for the {what}")))
+    } else {
+        Ok(handle)
+    }
+}
+
+fn cstring(s: String) -> Result<CString, Error> {
+    CString::new(s).map_err(|_| Error::Transport("a NUL byte in the socket settings".into()))
+}
+
+fn esp(err: sys::esp_err_t) -> Result<(), Error> {
+    sys::EspError::convert(err).map_err(|e| Error::Transport(e.to_string()))
+}
+
+/// The client's events, turned into what the run loop reads.
+///
+/// Text frames and the end of the socket are the run loop's business; pings,
+/// pongs, and the handshake are the client's own. Binary is ignored because
+/// Phoenix only ever sends text on this socket.
+///
+/// Forwarding the close is the whole point. Without it the channel stays open
+/// with nothing ever arriving on it, `recv` reports an idle socket forever, and
+/// the agent waits out the rest of its life for a frame from a connection that
+/// ended.
+///
+/// The client's ERROR event is deliberately *not* one of those. The client
+/// raises it for anything it dislikes, including during a normal connect, and a
+/// device that abandoned the session on each one never got as far as joining.
+/// A genuine failure is followed by a close, so waiting for the close costs
+/// nothing and reads far more of what is happening.
+struct Events {
+    state: Mutex<EventState>,
+}
+
+struct EventState {
+    tx: Sender<Incoming>,
+    /// A text message arriving in pieces: one per buffer-full of a frame, and
+    /// one frame per fragment of a fragmented message.
+    partial: Vec<u8>,
+}
+
+impl Events {
+    fn new(tx: Sender<Incoming>) -> Self {
+        Self {
+            state: Mutex::new(EventState {
+                tx,
+                partial: Vec::new(),
+            }),
+        }
+    }
+}
+
+const OPCODE_CONTINUATION: u8 = 0x0;
+const OPCODE_TEXT: u8 = 0x1;
+const OPCODE_CLOSE: u8 = 0x8;
+
+unsafe extern "C" fn on_event(
+    arg: *mut c_void,
+    _base: sys::esp_event_base_t,
+    id: i32,
+    data: *mut c_void,
+) {
+    let Some(events) = (arg as *const Events).as_ref() else { return };
+    let mut state = events.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    #[allow(non_upper_case_globals)]
+    match id {
+        sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA => {
+            if let Some(data) = (data as *const sys::esp_websocket_event_data_t).as_ref() {
+                state.data(data);
+            }
+        }
+        sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DISCONNECTED
+        | sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED => {
+            let _ = state.tx.send(Incoming::Closed);
         }
         _ => {}
     }
 }
 
+impl EventState {
+    fn data(&mut self, data: &sys::esp_websocket_event_data_t) {
+        let piece: &[u8] = if data.data_ptr.is_null() || data.data_len <= 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(data.data_ptr.cast(), data.data_len as usize) }
+        };
+
+        match data.op_code {
+            OPCODE_TEXT | OPCODE_CONTINUATION => {
+                // A text frame's first piece starts a message; anything else
+                // carries one on.
+                if data.op_code == OPCODE_TEXT && data.payload_offset == 0 {
+                    self.partial.clear();
+                }
+                self.partial.extend_from_slice(piece);
+
+                let frame_done = data.payload_offset + data.data_len >= data.payload_len;
+                if frame_done && data.fin {
+                    match String::from_utf8(core::mem::take(&mut self.partial)) {
+                        Ok(text) => {
+                            let _ = self.tx.send(Incoming::Text(text));
+                        }
+                        Err(_) => log::warn!("dropped a text frame that was not UTF-8"),
+                    }
+                }
+            }
+            OPCODE_CLOSE => {
+                let _ = self.tx.send(Incoming::Closed);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Transport for WebSocketTransport {
     fn send(&mut self, frame: &str) -> Result<(), Error> {
-        self.client
-            // `false` = not fragmented; the C client does not support
-            // fragmented sends anyway.
-            .send(FrameType::Text(false), frame.as_bytes())
-            .map_err(|e| Error::Transport(e.to_string()))
+        let sent = unsafe {
+            sys::esp_websocket_client_send_text(
+                self.client,
+                frame.as_ptr().cast(),
+                frame.len() as c_int,
+                self.send_timeout,
+            )
+        };
+        if sent < 0 {
+            Err(Error::Transport("websocket send failed".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn recv(&mut self) -> Result<Option<String>, Error> {
@@ -247,7 +464,7 @@ impl Transport for WebSocketTransport {
             // after this one is up. Only the client's own view of itself
             // decides that the session is over.
             Ok(Incoming::Closed) => {
-                if self.client.is_connected() {
+                if self.is_connected() {
                     log::debug!("ignoring a close for a socket that is still connected");
                     Ok(None)
                 } else {
