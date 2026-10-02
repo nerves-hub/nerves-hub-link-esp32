@@ -9,10 +9,11 @@
 //! # The protocol
 //!
 //! Extensions ride on their own Phoenix channel, joined separately from
-//! `device`:
+//! `device`, when the platform asks:
 //!
 //! ```text
-//! → join "extensions"        {"geo": "0.0.1", "health": "0.0.1"}
+//! ← "extensions:get"         {"extensions": {"geo": ["0.0.1"], "logging": ["0.1.0", "0.0.1"]}}
+//! → join "extensions"        {"geo": "0.0.1", "logging": "0.1.0"}
 //! ← reply                    ["geo"]                    // attached, geo only
 //! → "geo:attached"           {}                         // device confirms
 //! ← "geo:location:request"   {}
@@ -27,6 +28,20 @@
 //! Events are scoped as `<key>:<event>`, and the platform detaches any
 //! extension it does not recognise, so unknown traffic is answered rather than
 //! ignored.
+//!
+//! # Versions
+//!
+//! The invitation says which versions of each extension the platform has, and
+//! the join declares one per extension: the newest both sides have. An
+//! extension the invitation leaves out is not offered -- the platform doesn't
+//! have it, or has it switched off. NervesHub before September 2026 invited
+//! without naming anything, and serves the versions it always did, so then
+//! each extension is offered at its oldest version.
+//!
+//! Only logging has two: 0.0.1 sends a message per line, 0.1.0 a message per
+//! batch. NervesHub rate limits messages, not lines, and over a metered link
+//! each message carries its own TLS record, TCP segment and Phoenix envelope,
+//! so a batch is both what the limit allows and what the link can afford.
 
 use serde_json::{json, Map, Value};
 
@@ -35,9 +50,20 @@ use crate::message::{Message, RefGenerator};
 /// The channel extensions are carried on.
 pub const EXTENSIONS_TOPIC: &str = "extensions";
 
-/// The protocol version offered for every extension. NervesHub matches this
-/// with `~> 0.0.1`.
+/// The protocol version offered for every extension, when the platform names
+/// no versions. NervesHub matches this with `~> 0.0.1`.
 pub const EXTENSION_VERSION: &str = "0.0.1";
+
+/// Logging that carries a batch of lines per message.
+pub const LOGGING_BATCHED_VERSION: &str = "0.1.0";
+
+/// Every version this crate speaks of an extension, newest first.
+fn implemented(key: &str) -> &'static [&'static str] {
+    match key {
+        LOGGING => &[LOGGING_BATCHED_VERSION, EXTENSION_VERSION],
+        _ => &[EXTENSION_VERSION],
+    }
+}
 
 pub const GEO: &str = "geo";
 pub const HEALTH: &str = "health";
@@ -258,11 +284,45 @@ pub struct Extensions {
     enabled: Enabled,
     attached: Vec<String>,
     joined: bool,
+    invited: bool,
+    /// What the invitation said the platform has: `None` when it named
+    /// nothing, or hasn't arrived.
+    advertised: Option<Map<String, Value>>,
 }
 
 impl Extensions {
     pub fn new(enabled: Enabled) -> Self {
-        Self { enabled, attached: Vec::new(), joined: false }
+        Self { enabled, attached: Vec::new(), joined: false, invited: false, advertised: None }
+    }
+
+    /// The platform's `extensions:get`: join now, at these versions.
+    pub fn on_invitation(&mut self, payload: &Value) {
+        self.invited = true;
+        self.advertised = payload.get("extensions").and_then(Value::as_object).cloned();
+    }
+
+    /// Whether the platform has asked the device to join.
+    pub fn invited(&self) -> bool {
+        self.invited
+    }
+
+    /// The version to declare for `key`: the newest both sides have, or `None`
+    /// when the platform doesn't have it. See the module docs.
+    fn version(&self, key: &str) -> Option<&'static str> {
+        let ours = implemented(key);
+
+        match &self.advertised {
+            Some(advertised) => {
+                let theirs = advertised.get(key)?.as_array()?;
+                ours.iter().copied().find(|version| theirs.iter().any(|v| v == version))
+            }
+            None => ours.last().copied(),
+        }
+    }
+
+    /// Whether log lines go as batches: logging is attached, at 0.1.0.
+    pub fn logging_batched(&self) -> bool {
+        self.is_attached(LOGGING) && self.version(LOGGING) == Some(LOGGING_BATCHED_VERSION)
     }
 
     pub fn enabled(&self) -> Enabled {
@@ -293,7 +353,7 @@ impl Extensions {
             .enabled
             .offered()
             .into_iter()
-            .map(|key| (key.to_string(), json!(EXTENSION_VERSION)))
+            .filter_map(|key| Some((key.to_string(), json!(self.version(key)?))))
             .collect();
 
         Value::Object(map)
@@ -322,10 +382,13 @@ impl Extensions {
             .collect()
     }
 
-    /// The socket went away. The channel and every attachment go with it.
+    /// The socket went away. The channel and every attachment go with it, and
+    /// the next socket gets an invitation of its own.
     pub fn disconnected(&mut self) {
         self.joined = false;
         self.attached.clear();
+        self.invited = false;
+        self.advertised = None;
     }
 
     /// Handle an event the platform sent on the extensions channel.
@@ -368,6 +431,22 @@ impl Extensions {
         }
 
         vec![Outgoing::Send { event: "logging:send".into(), payload: line.payload() }]
+    }
+
+    /// Log lines, as few messages as the attached version allows: one for the
+    /// lot at 0.1.0, one each at 0.0.1. Nothing if logging isn't attached,
+    /// for the reason [`log`](Self::log) gives.
+    pub fn logs(&self, lines: &[LogLine]) -> Vec<Outgoing> {
+        if lines.is_empty() || !self.is_attached(LOGGING) {
+            return Vec::new();
+        }
+
+        if !self.logging_batched() {
+            return lines.iter().flat_map(|line| self.log(line)).collect();
+        }
+
+        let lines: Vec<Value> = lines.iter().map(LogLine::payload).collect();
+        vec![Outgoing::Send { event: "logging:send".into(), payload: json!({ "lines": lines }) }]
     }
 }
 
@@ -539,5 +618,104 @@ mod tests {
     fn unknown_events_are_ignored() {
         let mut extensions = attached(Enabled::none().geo(), &["geo"]);
         assert!(extensions.on_event("something:else", &json!({})).is_empty());
+    }
+
+    // What NervesHub sends from September 2026: both logging versions, and
+    // only the extensions this deployment has switched on.
+    fn advertising(enabled: Enabled, advertisement: Value) -> Extensions {
+        let mut extensions = Extensions::new(enabled);
+        extensions.on_invitation(&json!({ "extensions": advertisement }));
+        extensions
+    }
+
+    #[test]
+    fn the_join_declares_the_newest_version_both_sides_have() {
+        let extensions = advertising(
+            Enabled::none().health().logging(),
+            json!({"health": ["0.0.1"], "logging": ["0.1.0", "0.0.1"]}),
+        );
+
+        assert!(extensions.invited());
+        assert_eq!(extensions.join_params(), json!({"health": "0.0.1", "logging": "0.1.0"}));
+    }
+
+    // A platform that has only 0.0.1 gets 0.0.1, not a version it would leave
+    // unattached.
+    #[test]
+    fn logging_falls_back_to_the_version_the_platform_has() {
+        let extensions =
+            advertising(Enabled::none().logging(), json!({"logging": ["0.0.1"]}));
+
+        assert_eq!(extensions.join_params(), json!({"logging": "0.0.1"}));
+    }
+
+    #[test]
+    fn an_extension_the_platform_does_not_name_is_not_offered() {
+        let extensions =
+            advertising(Enabled::none().geo().health(), json!({"health": ["0.0.1"]}));
+
+        assert_eq!(extensions.join_params(), json!({"health": "0.0.1"}));
+    }
+
+    // NervesHub before September 2026 invites with an empty payload and serves
+    // 0.0.1 of everything.
+    #[test]
+    fn an_invitation_naming_nothing_gets_the_oldest_versions() {
+        let mut extensions = Extensions::new(Enabled::none().health().logging());
+        extensions.on_invitation(&json!({}));
+
+        assert_eq!(extensions.join_params(), json!({"health": "0.0.1", "logging": "0.0.1"}));
+    }
+
+    #[test]
+    fn batched_logging_sends_every_line_in_one_message() {
+        let mut extensions =
+            advertising(Enabled::none().logging(), json!({"logging": ["0.1.0", "0.0.1"]}));
+        let _ = extensions.on_join_reply(&json!(["logging"]));
+
+        let out = extensions.logs(&[LogLine::new("info", "one"), LogLine::new("warning", "two")]);
+
+        assert_eq!(out.len(), 1);
+        let Outgoing::Send { event, payload } = &out[0] else { panic!("expected a send") };
+        assert_eq!(event, "logging:send");
+        assert_eq!(
+            payload,
+            &json!({"lines": [
+                {"level": "info", "message": "one"},
+                {"level": "warning", "message": "two"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn unbatched_logging_sends_a_message_per_line() {
+        let mut extensions = Extensions::new(Enabled::none().logging());
+        extensions.on_invitation(&json!({}));
+        let _ = extensions.on_join_reply(&json!(["logging"]));
+
+        assert!(!extensions.logging_batched());
+        let out = extensions.logs(&[LogLine::new("info", "one"), LogLine::new("info", "two")]);
+        assert_eq!(out.len(), 2);
+    }
+
+    // The server spends a rate-limit token on every message, and drops an empty
+    // batch without storing anything.
+    #[test]
+    fn no_lines_is_no_message() {
+        let mut extensions =
+            advertising(Enabled::none().logging(), json!({"logging": ["0.1.0"]}));
+        let _ = extensions.on_join_reply(&json!(["logging"]));
+
+        assert!(extensions.logs(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_disconnect_waits_for_a_new_invitation() {
+        let mut extensions =
+            advertising(Enabled::none().logging(), json!({"logging": ["0.1.0"]}));
+        extensions.disconnected();
+
+        assert!(!extensions.invited());
+        assert_eq!(extensions.join_params(), json!({"logging": "0.0.1"}));
     }
 }

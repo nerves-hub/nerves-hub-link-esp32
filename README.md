@@ -428,6 +428,14 @@ esp::agent_with(config, AlwaysApply)?
 - **logging** sends what the `log` crate is given. `logging::install` replaces
   `EspLogger::initialize_default()` and keeps writing to the console. It does
   not capture ESP-IDF's own C logging, which never reaches the `log` crate.
+  Where NervesHub has logging 0.1.0 the lines go in batches, a second's worth
+  per message and a sleeping device's whole backlog in the first; elsewhere one
+  line per message, four a second.
+
+The extensions channel is joined when NervesHub sends `extensions:get`, which
+names the versions of each extension it has, and the join declares the newest
+of each that both sides speak. A NervesHub that never asks still gets a join,
+five seconds after the device's, at the versions every NervesHub has.
 
 `on_identify` runs when an operator presses Identify in NervesHub. Reboot needs
 nothing: the agent answers it and restarts.

@@ -169,12 +169,48 @@ impl LogBuffer {
     /// approximate time applied here is the difference between a boot-time log
     /// arriving late and not arriving.
     pub fn pop_stamped(&self, now_micros: Option<u64>) -> Option<LogLine> {
-        let line = self.pop()?;
+        Some(stamp(self.pop()?, now_micros))
+    }
 
-        Some(match (line.has_time(), now_micros) {
-            (false, Some(micros)) => line.with_time(micros),
-            _ => line,
-        })
+    /// Lines to send as one batch, oldest first, each stamped as
+    /// [`pop_stamped`](Self::pop_stamped) stamps it -- except that lines
+    /// stamped here are a microsecond apart, in order. They would otherwise
+    /// all share one time, and NervesHub, which orders by time, would show a
+    /// boot's worth of lines in no particular order.
+    ///
+    /// Stops at `max_lines`, or before the line that would take the batch past
+    /// roughly `max_bytes` of JSON -- though never before the first, so a
+    /// single long line still goes. The note about dropped lines joins the
+    /// batch that empties the backlog, as it follows the last line `pop` does.
+    pub fn take_stamped(&self, max_lines: usize, max_bytes: usize, now_micros: Option<u64>) -> Vec<LogLine> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+
+        {
+            let Ok(mut lines) = self.lines.lock() else { return batch };
+
+            while batch.len() < max_lines {
+                let Some(next) = lines.front() else { break };
+
+                let size = approximate_json_len(next);
+                if !batch.is_empty() && bytes + size > max_bytes {
+                    return batch;
+                }
+
+                bytes += size;
+                if let Some(line) = lines.pop_front() {
+                    batch.push(stamp(line, now_micros.map(|t| t + batch.len() as u64)));
+                }
+            }
+        }
+
+        if batch.len() < max_lines {
+            if let Some(note) = self.pop() {
+                batch.push(stamp(note, now_micros.map(|t| t + batch.len() as u64)));
+            }
+        }
+
+        batch
     }
 
     /// The next line to send, if there is one.
@@ -210,6 +246,22 @@ impl LogBuffer {
     pub fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
     }
+}
+
+fn stamp(line: LogLine, now_micros: Option<u64>) -> LogLine {
+    match (line.has_time(), now_micros) {
+        (false, Some(micros)) => line.with_time(micros),
+        _ => line,
+    }
+}
+
+/// About what a line costs as JSON in a batch: its strings, plus the keys,
+/// quotes and punctuation around them. Escaping can make it more, which is why
+/// the budget it is checked against leaves room.
+fn approximate_json_len(line: &LogLine) -> usize {
+    let meta: usize = line.meta.iter().map(|(key, value)| key.len() + value.len() + 6).sum();
+    let timestamp = line.timestamp.as_ref().map_or(0, |t| t.len() + 16);
+    line.level.len() + line.message.len() + timestamp + meta + 40
 }
 
 /// A `log::Log` that writes to the console as before and keeps a copy.
@@ -300,6 +352,80 @@ mod tests {
 
     fn line(message: &str) -> LogLine {
         LogLine::new("info", message)
+    }
+
+    #[test]
+    fn a_batch_takes_lines_oldest_first_up_to_the_count() {
+        let buffer = LogBuffer::new(8);
+        for message in ["one", "two", "three"] {
+            buffer.push(line(message));
+        }
+
+        let batch = buffer.take_stamped(2, 10_000, None);
+
+        assert_eq!(batch.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    // Each line NervesHub stores needs a time, and a batch is no exception.
+    #[test]
+    fn a_batch_is_stamped() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(line("unstamped"));
+
+        let batch = buffer.take_stamped(10, 10_000, Some(1_790_000_000_000_000));
+
+        assert!(batch[0].has_time());
+    }
+
+    #[test]
+    fn a_batch_stamps_its_lines_in_order() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(line("first"));
+        buffer.push(line("second"));
+
+        let batch = buffer.take_stamped(10, 10_000, Some(1_000));
+        let times: Vec<_> = batch
+            .iter()
+            .map(|l| l.meta.iter().find(|(k, _)| k == "time").unwrap().1.clone())
+            .collect();
+
+        assert_eq!(times, ["1000", "1001"]);
+    }
+
+    // A batch stays within one websocket frame, so the rest waits for the next.
+    #[test]
+    fn a_batch_stops_before_the_byte_budget() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(line(&"a".repeat(100)));
+        buffer.push(line(&"b".repeat(100)));
+
+        let batch = buffer.take_stamped(10, 200, None);
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    // Otherwise a line longer than the budget would never leave.
+    #[test]
+    fn a_batch_always_takes_its_first_line() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(line(&"a".repeat(500)));
+
+        assert_eq!(buffer.take_stamped(10, 100, None).len(), 1);
+    }
+
+    #[test]
+    fn the_batch_that_clears_the_backlog_reports_the_loss() {
+        let buffer = LogBuffer::new(1);
+        buffer.push(line("kept"));
+        buffer.push(line("lost"));
+
+        let batch = buffer.take_stamped(10, 10_000, None);
+
+        assert_eq!(batch.len(), 2);
+        assert!(batch[1].message.contains("1 log lines were dropped"));
+        assert!(buffer.take_stamped(10, 10_000, None).is_empty());
     }
 
     #[test]
