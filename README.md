@@ -219,6 +219,15 @@ answered, the queued log sent -- or at `limit`. Nothing is retried: a refused
 connection, or a session the server ends early, is an `Error::Transport`,
 because only the application knows what another attempt costs its battery.
 
+Over a cellular link, give the connection longer to come up. DNS, TCP, the TLS
+handshake and the websocket upgrade must all complete inside
+`Config::connect_timeout_secs`, which defaults to 10. Over LTE-M, on an
+ESP32-S3, the TLS handshake alone has been measured at 5.5 to 11.5 seconds:
+
+```rust
+config.connect_timeout_secs = 30;
+```
+
 ## Project setup
 
 Five things, none of which this crate can do for you.

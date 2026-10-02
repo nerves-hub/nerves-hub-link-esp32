@@ -107,6 +107,8 @@ impl WebSocketTransport {
             }
         };
 
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+
         let ws_config = EspWebSocketClientConfig {
             client_cert,
             client_key,
@@ -142,13 +144,20 @@ impl WebSocketTransport {
             // in this.
             buffer_size: 4096,
 
+            // The IDF client's own bound on connecting -- DNS, TCP, TLS --
+            // which it otherwise defaults to 10 s, too short for a TLS
+            // handshake over a slow cellular link. See
+            // `Config::connect_timeout_secs`.
+            network_timeout_ms: connect_timeout,
+
             ..Default::default()
         };
 
-        let timeout = Duration::from_secs(10);
+        // Bounds each send and the close, not the connect.
+        let send_timeout = Duration::from_secs(10);
 
         let client =
-            EspWebSocketClient::new(&config.socket_url(), &ws_config, timeout, move |event| {
+            EspWebSocketClient::new(&config.socket_url(), &ws_config, send_timeout, move |event| {
                 handle_event(&tx, event);
             })
             .map_err(|e: EspIOError| Error::Transport(e.to_string()))?;
@@ -164,7 +173,7 @@ impl WebSocketTransport {
         // never connected, which esp-idf-svc 0.53 logs before destroying it;
         // earlier versions unwrapped it and aborted the device, turning a
         // refused connection into a boot loop.
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + connect_timeout;
         while !client.is_connected() {
             if Instant::now() >= deadline {
                 return Err(Error::Transport(
