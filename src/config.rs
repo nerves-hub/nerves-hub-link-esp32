@@ -6,6 +6,7 @@ use crate::error::Error;
 use crate::extensions::Enabled;
 use crate::shared_secret::SharedSecret;
 use crate::message::{DEVICE_API_VERSION, SERIALIZER_VSN};
+use crate::tls_session::TlsSession;
 
 /// How the device proves who it is.
 ///
@@ -118,6 +119,11 @@ pub struct Config {
     /// Which extensions to offer. None by default — an extension sends data an
     /// operator may not expect a device to send, so it is asked for explicitly.
     pub extensions: Enabled,
+    /// The TLS session the next connection offers to resume, and where each
+    /// handshake leaves the one after it. Empty to start with, which still
+    /// resumes across reconnects within a boot; a device that sleeps restores
+    /// it from RTC memory. See [`TlsSession`].
+    pub tls_session: TlsSession,
 }
 
 impl Config {
@@ -134,16 +140,19 @@ impl Config {
             reconnect_backoff_secs: vec![1, 2, 5, 10, 30, 60],
             progress_step_percent: 5,
             extensions: Enabled::none(),
+            tls_session: TlsSession::new(),
         }
     }
 
     /// The socket URL, including the `vsn` that selects the JSON serializer.
     pub fn socket_url(&self) -> String {
         let scheme = if self.use_tls { "wss" } else { "ws" };
-        format!(
-            "{}://{}:{}/device-socket/websocket?vsn={}",
-            scheme, self.host, self.port, SERIALIZER_VSN
-        )
+        format!("{}://{}:{}{}", scheme, self.host, self.port, self.socket_path())
+    }
+
+    /// The path the websocket upgrade asks for, query and all.
+    pub fn socket_path(&self) -> String {
+        format!("/device-socket/websocket?vsn={}", SERIALIZER_VSN)
     }
 
     pub fn backoff_for(&self, attempt: usize) -> u64 {
@@ -210,6 +219,13 @@ mod tests {
             config().socket_url(),
             "wss://devices.nerves-hub.org:443/device-socket/websocket?vsn=2.0.0"
         );
+    }
+
+    // The upgrade request is built from the path alone once the transport
+    // under the websocket is this crate's, so it has to carry the query.
+    #[test]
+    fn socket_path_keeps_the_serializer_query() {
+        assert_eq!(config().socket_path(), "/device-socket/websocket?vsn=2.0.0");
     }
 
     #[test]

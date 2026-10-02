@@ -228,6 +228,51 @@ ESP32-S3, the TLS handshake alone has been measured at 5.5 to 11.5 seconds:
 config.connect_timeout_secs = 30;
 ```
 
+### Resuming the TLS session
+
+Most of that handshake is the server's certificates, key exchange and, from
+NervesCloud, a certificate request listing every CA it trusts: about 15 KB down
+and three round trips. A resumed session is a ServerHello and a Finished, 143
+bytes and one round trip. On an ESP32-S3 over LTE-M that took a report from
+31.5 KB and an 11.6 s connect to 11.3 KB and 2.1 s.
+
+Reconnects within a boot resume on their own. Across a deep sleep the session
+has to be kept somewhere that survives it, which is RTC memory, and handed
+back:
+
+```rust
+use nerves_hub_link_esp32::TlsSession;
+
+#[link_section = ".rtc.data"]
+static mut SESSION: [u8; 256] = [0; 256];
+// ... and its length, beside it
+
+config.tls_session = TlsSession::restore(saved_bytes);
+let session = config.tls_session.clone(); // the same slot, not a copy
+
+let outcome = esp::agent_with(config, policy)?.run_session(window);
+
+if let Some(bytes) = session.saved() {
+    // copy into RTC memory for the next wake
+}
+```
+
+It needs, in `sdkconfig.defaults`:
+
+```
+CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
+# CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
+```
+
+The first lets esp-tls offer a session at all. The second keeps the server's
+certificate out of the saved session, which is then about 150 bytes rather than
+1.3 KB; nothing reads the certificate after the handshake. The saved bytes hold
+the session's master secret, so keep them in RTC memory, not flash or a log.
+
+Nothing is lost when the server has forgotten the session -- restarted, evicted
+it, or is another node behind a load balancer: the handshake is a full one and
+its session replaces the old.
+
 ## Project setup
 
 Five things, none of which this crate can do for you.
@@ -522,6 +567,8 @@ src/
 
   esp.rs        EspPlatform + the one-call entry point
   transport.rs  esp_websocket_client          (impl Transport)
+  tls.rs        esp-tls under the websocket, with a session the app can keep
+  tls_session.rs  the session, between connections and across sleep
   http.rs       EspHttpConnection             (impl HttpStream)
   ota.rs        esp_ota + esp_delta_ota       (impl ImageSink)
   health.rs     memory, RSSI, reset reason    (impl HealthProvider)
