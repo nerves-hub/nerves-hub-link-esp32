@@ -65,7 +65,7 @@ pub mod transport;
 pub mod update;
 pub mod whenwhere;
 
-pub use agent::{Agent, Platform, SessionWindow, Stopped};
+pub use agent::{Agent, Control, Platform, SessionWindow, Stopped};
 pub use config::{Config, Credentials};
 pub use error::Error;
 pub use install::{install, HttpStream, ImageSink, InstallReport};

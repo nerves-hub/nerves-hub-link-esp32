@@ -228,6 +228,35 @@ ESP32-S3, the TLS handshake alone has been measured at 5.5 to 11.5 seconds:
 config.connect_timeout_secs = 30;
 ```
 
+### Staying online when it's affordable
+
+A device that sleeps on battery may still be on mains or USB some of the time,
+and then there is no reason to leave. `run_session_until` keeps the session
+open until the application says otherwise, and gives it a turn between frames
+-- at least every half a second or so while the socket is quiet -- to do its
+own work there:
+
+```rust
+use nerves_hub_link_esp32::Control;
+
+config.heartbeat_interval_secs = 120; // under NervesHub's 3-minute socket timeout
+
+let outcome = agent.run_session_until(|| {
+    if !on_external_power() {
+        Control::Leave
+    } else if readings_are_due() {
+        refresh_readings(); // the health provider reports these
+        Control::ReportHealth
+    } else {
+        Control::Stay
+    }
+});
+```
+
+`Control::ReportHealth` sends a report from the health provider now, rather
+than when NervesHub next asks, which it does only hourly unless someone has the
+device's page open. As with `run_session`, nothing is retried.
+
 ### Resuming the TLS session
 
 Most of that handshake is the server's certificates, key exchange and, from

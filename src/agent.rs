@@ -109,9 +109,24 @@ const EXTENSIONS_INVITATION_WAIT_MS: u64 = 5_000;
 pub enum Stopped {
     /// An update was applied and the device is rebooting into it.
     Rebooting,
-    /// A bounded session ran its course: see [`Agent::run_session`]. Never
-    /// returned by [`Agent::run`].
+    /// A bounded session ran its course, or the caller of an open-ended one
+    /// asked it to end: see [`Agent::run_session`] and
+    /// [`Agent::run_session_until`]. Never returned by [`Agent::run`].
     Finished,
+}
+
+/// What the caller of an open-ended session wants next. See
+/// [`Agent::run_session_until`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Carry on.
+    Stay,
+    /// Send a health report now, then carry on: the readings have moved on
+    /// since the platform last asked. Ignored until health is attached, since
+    /// attaching asks for one anyway.
+    ReportHealth,
+    /// End the session.
+    Leave,
 }
 
 /// How long one session lasts, for a device that sleeps between them.
@@ -594,11 +609,44 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         let mut transport = self.platform.connect(&self.config)?;
         let mut joined = false;
 
-        match self.session_within(&mut transport, &mut joined, Some(window))? {
+        match self.session_within(&mut transport, &mut joined, Some(window), None)? {
             Some(stopped) => Ok(stopped),
             // The socket closed or the server asked for a reconnect. `run`
             // would come straight back; a bounded session reports it, and the
             // join state says whether anything got through first.
+            None => Err(Error::Transport(format!(
+                "session ended by the connection (joined: {joined})"
+            ))),
+        }
+    }
+
+    /// Connect once and stay connected until `control` says to leave.
+    ///
+    /// For a device that can afford to stay online -- on mains or USB power,
+    /// say -- but has its own work to do while it is: `control` is called
+    /// between frames, at least every half a second or so while the socket is
+    /// quiet, and the device does that work there. It can ask for a health
+    /// report when its readings have moved on, which the platform would
+    /// otherwise only ask for every hour or so, and say when the session
+    /// should end. It runs on this thread, so it must return promptly: the
+    /// session is waiting on it.
+    ///
+    /// As with [`Agent::run_session`], nothing is retried. A connection that
+    /// fails or drops comes back as [`Error::Transport`]; [`Stopped::Finished`]
+    /// means `control` asked to leave; [`Stopped::Rebooting`] follows an
+    /// update or an operator's reboot.
+    ///
+    /// Keep [`Config::heartbeat_interval_secs`] under NervesHub's socket
+    /// timeout (three minutes), and under whatever the network's NAT allows an
+    /// idle connection, or the socket closes between heartbeats.
+    ///
+    /// [`Config::heartbeat_interval_secs`]: crate::Config::heartbeat_interval_secs
+    pub fn run_session_until(&mut self, mut control: impl FnMut() -> Control) -> Result<Stopped, Error> {
+        let mut transport = self.platform.connect(&self.config)?;
+        let mut joined = false;
+
+        match self.session_within(&mut transport, &mut joined, None, Some(&mut control))? {
+            Some(stopped) => Ok(stopped),
             None => Err(Error::Transport(format!(
                 "session ended by the connection (joined: {joined})"
             ))),
@@ -614,15 +662,17 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
         transport: &mut P::Transport,
         joined: &mut bool,
     ) -> Result<Option<Stopped>, Error> {
-        self.session_within(transport, joined, None)
+        self.session_within(transport, joined, None, None)
     }
 
-    /// A session, ending at the window if there is one.
+    /// A session, ending at the window if there is one, or when `control`
+    /// says so.
     fn session_within(
         &mut self,
         transport: &mut P::Transport,
         joined: &mut bool,
         window: Option<SessionWindow>,
+        mut control: Option<&mut dyn FnMut() -> Control>,
     ) -> Result<Option<Stopped>, Error> {
         let mut link = Link::new(self.config.clone(), self.metadata.clone());
 
@@ -708,6 +758,24 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             }
 
             send_logs(&mut link, transport, self.logs.as_deref(), now, &mut last_log)?;
+
+            // Asked between frames, like the window below, so an update that
+            // is installing always finishes first.
+            if let Some(control) = control.as_mut() {
+                match control() {
+                    Control::Stay => {}
+                    Control::ReportHealth => {
+                        let attached = link
+                            .attached_extensions()
+                            .iter()
+                            .any(|key| key == crate::extensions::HEALTH);
+                        if attached {
+                            self.answer_extension(&mut link, transport, vec![Outgoing::NeedHealth])?;
+                        }
+                    }
+                    Control::Leave => return Ok(Some(Stopped::Finished)),
+                }
+            }
 
             // Checked between frames, never inside one: an update runs inside
             // `apply` below and so always finishes, however long it takes.
@@ -2062,5 +2130,79 @@ mod tests {
             assert!(batches[0].contains(message), "{}", batches[0]);
         }
         assert!(logs.is_empty());
+    }
+
+    // An open-ended session ends when its caller says, not at a linger or a
+    // limit, and has confirmed the image on the way like any other.
+    #[test]
+    fn an_open_ended_session_leaves_when_asked() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(1_000));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+        let mut agent = agent(plat);
+
+        let mut calls = 0;
+        let stopped = agent
+            .run_session_until(|| {
+                calls += 1;
+                if calls < 50 { Control::Stay } else { Control::Leave }
+            })
+            .unwrap();
+
+        assert_eq!(stopped, Stopped::Finished);
+        assert_eq!(calls, 50);
+        assert!(events(&shared).contains(&"firmware_validated".to_string()));
+    }
+
+    // The platform asks on attach and then only hourly; the device knows when
+    // its readings have moved on. Before health is attached, asking does
+    // nothing -- attaching brings a check of its own.
+    #[test]
+    fn an_open_ended_session_reports_health_when_asked() {
+        let mut frames = vec![
+            join_reply(json!({"update_available": false})),
+            invitation(json!({"health": ["0.0.1"]})),
+            health_attached(),
+            health_check(),
+        ];
+        frames.extend(quiet(1_000));
+
+        let plat = platform(vec![frames]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.extensions = crate::extensions::Enabled::none().health();
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply).with_health(FakeHealth);
+
+        let mut calls = 0;
+        agent
+            .run_session_until(|| {
+                calls += 1;
+                match calls {
+                    // Before the join reply has even been read.
+                    1 => Control::ReportHealth,
+                    20 => Control::ReportHealth,
+                    40 => Control::Leave,
+                    _ => Control::Stay,
+                }
+            })
+            .unwrap();
+
+        let reports = shared.borrow().sent.iter().filter(|f| f.contains("health:report")).count();
+        assert_eq!(reports, 2, "one for the platform's check, one asked for");
+    }
+
+    // Nothing is retried: the caller decides what another attempt costs.
+    #[test]
+    fn an_open_ended_session_that_drops_is_an_error() {
+        let plat = platform(vec![vec![join_reply(json!({"update_available": false}))]]);
+        let mut agent = agent(plat);
+
+        match agent.run_session_until(|| Control::Stay) {
+            Err(Error::Transport(reason)) => assert!(reason.contains("joined: true"), "{reason}"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
     }
 }
