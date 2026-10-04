@@ -101,7 +101,12 @@ pub struct Config {
     pub use_tls: bool,
     /// Reported on join; NervesHub gates features on it.
     pub device_api_version: String,
-    /// Phoenix heartbeat interval. Must stay under the server's socket timeout.
+    /// Phoenix heartbeat interval. Must stay under the server's socket timeout
+    /// (three minutes on NervesHub).
+    ///
+    /// It is also how a dead connection is noticed: a heartbeat still
+    /// unanswered when the next is due ends the session, so one can go
+    /// unnoticed for up to two intervals.
     pub heartbeat_interval_secs: u64,
     /// How long a connection has to come up: DNS, TCP, the TLS handshake and
     /// the websocket upgrade, end to end. Past it the attempt is abandoned as

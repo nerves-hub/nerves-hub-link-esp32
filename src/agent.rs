@@ -753,6 +753,15 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             let now = self.platform.now_ms();
 
             if now.saturating_sub(last_heartbeat) >= heartbeat_ms {
+                // A transport error, so `run` reconnects and a bounded session
+                // reports it, with the reason: a server that stopped answering
+                // is a different problem in the field from a socket that died.
+                if link.heartbeat_unanswered() {
+                    return Err(Error::Transport(format!(
+                        "no reply to a heartbeat in {}s",
+                        heartbeat_ms / 1_000
+                    )));
+                }
                 link.send_heartbeat(transport)?;
                 last_heartbeat = now;
             }
@@ -813,6 +822,11 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                     if self.apply(&mut link, transport, &update)? {
                         return Ok(Some(Stopped::Rebooting));
                     }
+
+                    // The download heartbeats without reading (see `Pump`), so
+                    // the last one's reply is still queued. A full interval to
+                    // read it, rather than a timeout for a reply sitting unread.
+                    last_heartbeat = self.platform.now_ms();
                 }
                 Ok(Action::Reboot) => {
                     // Answered before restarting, not after: the socket is
@@ -1132,12 +1146,26 @@ mod tests {
         /// A socket that has gone away under a write, which is what a close
         /// racing a heartbeat looks like from the sending side.
         send_fails: bool,
+        /// Answer each heartbeat as Phoenix does, next in line to be read.
+        answer_heartbeats: bool,
     }
 
     impl Transport for FakeTransport {
         fn send(&mut self, frame: &str) -> Result<(), Error> {
             if self.send_fails {
                 return Err(Error::Transport("closed".into()));
+            }
+
+            if self.answer_heartbeats {
+                if let Ok(message) = Message::decode(frame) {
+                    if message.topic == "phoenix" && message.event == "heartbeat" {
+                        let reference = message.reference.unwrap_or_default();
+                        let reply = format!(
+                            r#"[null,"{reference}","phoenix","phx_reply",{{"status":"ok","response":{{}}}}]"#
+                        );
+                        self.incoming.borrow_mut().insert(0, Ok(Some(reply)));
+                    }
+                }
             }
 
             self.shared.borrow_mut().sent.push(frame.to_string());
@@ -1197,6 +1225,7 @@ mod tests {
         /// winds this up rather than building a multi-megabyte image.
         clock_step_ms: u64,
         send_fails: bool,
+        answer_heartbeats: bool,
     }
 
     impl Platform for FakePlatform {
@@ -1224,6 +1253,7 @@ mod tests {
                 shared: Rc::clone(&self.shared),
                 incoming: Rc::new(RefCell::new(frames)),
                 send_fails: self.send_fails,
+                answer_heartbeats: self.answer_heartbeats,
             })
         }
 
@@ -1312,6 +1342,7 @@ mod tests {
             clock_ms: 0,
             clock_step_ms: 1,
             send_fails: false,
+            answer_heartbeats: false,
         }
     }
 
@@ -2192,6 +2223,104 @@ mod tests {
 
         let reports = shared.borrow().sent.iter().filter(|f| f.contains("health:report")).count();
         assert_eq!(reports, 2, "one for the platform's check, one asked for");
+    }
+
+    fn heartbeats(shared: &Rc<RefCell<Shared>>) -> usize {
+        events(shared).iter().filter(|event| *event == "heartbeat").count()
+    }
+
+    // A proxy can hold the socket open with nothing behind it: writes land,
+    // keepalives are answered, and only the missing reply gives it away.
+    #[test]
+    fn an_open_ended_session_ends_when_a_heartbeat_goes_unanswered() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(1_000));
+
+        let mut plat = platform(vec![frames]);
+        plat.clock_step_ms = 100;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.heartbeat_interval_secs = 1;
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply);
+
+        match agent.run_session_until(|| Control::Stay) {
+            Err(Error::Transport(reason)) => {
+                assert!(reason.contains("no reply to a heartbeat"), "{reason}")
+            }
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert_eq!(heartbeats(&shared), 1, "the second falls due with the first unanswered");
+    }
+
+    #[test]
+    fn answered_heartbeats_keep_an_open_ended_session() {
+        let mut frames = vec![join_reply(json!({"update_available": false}))];
+        frames.extend(quiet(1_000));
+
+        let mut plat = platform(vec![frames]);
+        plat.clock_step_ms = 100;
+        plat.answer_heartbeats = true;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        cfg.heartbeat_interval_secs = 1;
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply);
+
+        let mut calls = 0;
+        let stopped = agent
+            .run_session_until(|| {
+                calls += 1;
+                if calls < 200 { Control::Stay } else { Control::Leave }
+            })
+            .unwrap();
+
+        assert_eq!(stopped, Stopped::Finished);
+        assert!(heartbeats(&shared) >= 5, "only {} heartbeats", heartbeats(&shared));
+    }
+
+    // A download heartbeats without reading, so the replies wait in the queue.
+    // An update that fails leaves the session going, and those unread replies
+    // must not read as a server that stopped answering.
+    #[test]
+    fn a_failed_update_doesnt_look_like_an_unanswered_heartbeat() {
+        // Twenty-four chunks at half a second each: two heartbeats go out during it.
+        let image = vec![7u8; 4096 * 24];
+
+        let update = json!({
+            "update_available": true,
+            "firmware_url": "https://example.test/fw.bin",
+            "firmware_meta": {"uuid": "uuid-1"},
+            "size": image.len(),
+            "checksum": "00".repeat(32)
+        });
+
+        let mut frames = vec![join_reply(update)];
+        frames.extend(quiet(1_000));
+
+        let mut plat = platform(vec![frames]);
+        plat.image = image;
+        plat.clock_step_ms = 500;
+        plat.answer_heartbeats = true;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut cfg = config();
+        // Long against the fake clock's half-second steps, as a real interval is
+        // against the loop's reads: the replies get read before the next is due.
+        cfg.heartbeat_interval_secs = 5;
+        let mut agent = Agent::new(cfg, metadata(), plat, AlwaysApply);
+
+        let mut calls = 0;
+        let stopped = agent
+            .run_session_until(|| {
+                calls += 1;
+                if calls < 40 { Control::Stay } else { Control::Leave }
+            })
+            .unwrap();
+
+        assert_eq!(stopped, Stopped::Finished);
+        assert_eq!(shared.borrow().commits, 0, "the bad image was not applied");
+        assert!(heartbeats(&shared) >= 4, "only {} heartbeats", heartbeats(&shared));
     }
 
     // Nothing is retried: the caller decides what another attempt costs.
