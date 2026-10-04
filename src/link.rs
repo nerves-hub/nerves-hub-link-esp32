@@ -81,6 +81,8 @@ pub struct Link {
     console_wanted: bool,
     joined: bool,
     downloading: Option<String>,
+    /// The last heartbeat's ref until its reply arrives.
+    heartbeat_ref: Option<String>,
 }
 
 impl Link {
@@ -98,6 +100,7 @@ impl Link {
             console_wanted: false,
             joined: false,
             downloading: None,
+            heartbeat_ref: None,
         }
     }
 
@@ -140,10 +143,22 @@ impl Link {
 
     pub fn send_heartbeat<T: Transport>(&mut self, transport: &mut T) -> Result<(), Error> {
         let reference = self.refs.next_ref();
+        self.heartbeat_ref = Some(reference.clone());
 
         // Heartbeats go to the "phoenix" topic and carry no join_ref.
         let message = Message::new(CONTROL_TOPIC, event::HEARTBEAT, json!({}));
         self.write(transport, &message.with_refs(None, Some(reference)))
+    }
+
+    /// Whether the last heartbeat is still waiting for its reply.
+    ///
+    /// Asked when the next one is due, as Phoenix's own clients do (phoenix.js,
+    /// Slipstream): a reply that hasn't come back in a whole interval means the
+    /// connection is gone, whatever TCP says. A proxy in the path can keep the
+    /// socket looking healthy -- answering keepalives, taking writes -- long
+    /// after nothing behind it is listening.
+    pub fn heartbeat_unanswered(&self) -> bool {
+        self.heartbeat_ref.is_some()
     }
 
     pub fn send_progress<T: Transport>(
@@ -240,6 +255,18 @@ impl Link {
 
         if message.topic == CONSOLE_TOPIC {
             return self.handle_console_frame(transport, &message);
+        }
+
+        // Only heartbeats go to "phoenix", so a reply there is a heartbeat's.
+        // Any reply proves the server is there, whatever its status.
+        if message.topic == CONTROL_TOPIC {
+            let answers_heartbeat = message.event == event::REPLY
+                && message.reference.is_some()
+                && message.reference == self.heartbeat_ref;
+            if answers_heartbeat {
+                self.heartbeat_ref = None;
+            }
+            return Ok(Action::None);
         }
 
         match message.event.as_str() {
@@ -671,6 +698,57 @@ mod tests {
         assert_eq!(sent.topic, "phoenix");
         assert_eq!(sent.event, "heartbeat");
         assert_eq!(sent.join_ref, None);
+    }
+
+    fn heartbeat_reply_with(reference: &str, status: &str) -> String {
+        format!(
+            r#"[null,"{reference}","phoenix","phx_reply",{{"status":"{status}","response":{{}}}}]"#
+        )
+    }
+
+    fn heartbeat_reply(reference: &str) -> String {
+        heartbeat_reply_with(reference, "ok")
+    }
+
+    #[test]
+    fn a_heartbeat_waits_for_its_reply() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        assert!(!link.heartbeat_unanswered(), "nothing sent yet");
+
+        link.send_heartbeat(&mut transport).unwrap();
+        assert!(link.heartbeat_unanswered());
+
+        let reference = transport.last().reference.unwrap();
+        let reply = heartbeat_reply(&reference);
+        let action = link.handle_frame(&mut transport, &mut AlwaysApply, &reply).unwrap();
+        assert_eq!(action, Action::None);
+        assert!(!link.heartbeat_unanswered());
+    }
+
+    // A late reply to an earlier heartbeat says nothing about the latest one.
+    #[test]
+    fn only_the_last_heartbeats_reply_answers_it() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+
+        link.send_heartbeat(&mut transport).unwrap();
+        let first = transport.last().reference.unwrap();
+        link.send_heartbeat(&mut transport).unwrap();
+
+        link.handle_frame(&mut transport, &mut AlwaysApply, &heartbeat_reply(&first)).unwrap();
+        assert!(link.heartbeat_unanswered());
+    }
+
+    // Phoenix answers a heartbeat it can't place with an error reply, and that
+    // is still a server answering.
+    #[test]
+    fn an_error_reply_still_answers_a_heartbeat() {
+        let (mut link, mut transport) = (link(), FakeTransport::default());
+        link.send_heartbeat(&mut transport).unwrap();
+        let reference = transport.last().reference.unwrap();
+
+        let reply = heartbeat_reply_with(&reference, "error");
+        link.handle_frame(&mut transport, &mut AlwaysApply, &reply).unwrap();
+        assert!(!link.heartbeat_unanswered());
     }
 
     #[test]

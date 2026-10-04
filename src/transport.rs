@@ -54,6 +54,9 @@ use crate::link::Transport;
 use crate::message::Frame;
 use crate::tls;
 
+/// Effectively never: see the client config in [`WebSocketTransport::connect`].
+const WEBSOCKET_PING_INTERVAL_SECS: usize = 24 * 60 * 60;
+
 /// What the client's callback hands to the run loop.
 ///
 /// A close has to travel the same channel as the frames, in order with them:
@@ -184,11 +187,16 @@ impl WebSocketTransport {
             uri: uri.as_ptr(),
             ext_transport: partial.ws,
 
-            // Phoenix has its own heartbeat on the "phoenix" topic; this is the
-            // transport-level one. Both are wanted — the transport ping detects
-            // a dead TCP connection, the Phoenix heartbeat keeps the channel
-            // alive server-side.
-            ping_interval_sec: config.heartbeat_interval_secs as _,
+            // No websocket pings, near enough. The Phoenix heartbeat already
+            // does both jobs: any frame keeps NervesHub's socket timeout at bay,
+            // and an unanswered one is how the agent notices a dead connection
+            // (see `Link::heartbeat_unanswered`). A ping on top doubled the
+            // keepalive traffic, which on a metered cellular link is most of
+            // what an idle session sends. The client can't switch pings off --
+            // 0 means its 10 s default -- so they go once a day, and a missing
+            // pong no longer ends the session.
+            ping_interval_sec: WEBSOCKET_PING_INTERVAL_SECS,
+            disable_pingpong_discon: true,
 
             // Frames bigger than the buffer arrive in pieces, which `Events`
             // puts back together, so this is about how many pieces rather than

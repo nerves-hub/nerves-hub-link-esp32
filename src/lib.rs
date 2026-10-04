@@ -25,6 +25,7 @@
 //!        │     firmware_validated ──────────► and esp_ota_mark_app_valid()
 //!        │
 //!        ├─ heartbeat every 30s ────────────► "phoenix" topic
+//!        │  (one still unanswered when the next is due ends the session)
 //!        │
 //!        └─ on "update":
 //!              download ──► esp_ota write ──► verify checksum
