@@ -20,6 +20,10 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # certificate and is about 1.3 KB rather than 150 bytes.
 CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
 # CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
+#
+# TLS 1.3 (CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y) needs the peer certificate kept,
+# so an application that wants it sets KEEP_PEER_CERTIFICATE=y instead. See the
+# README's "TLS 1.3".
 
 # esp-idf-svc needs a larger main task stack than the default once TLS is in
 # the picture.

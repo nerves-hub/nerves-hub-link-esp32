@@ -67,7 +67,7 @@ pub mod update;
 pub mod whenwhere;
 
 pub use agent::{Agent, Control, Platform, SessionWindow, Stopped};
-pub use config::{Config, Credentials};
+pub use config::{Config, Credentials, TlsVersion};
 pub use error::Error;
 pub use install::{install, HttpStream, ImageSink, InstallReport};
 pub use link::{Action, AlwaysApply, Link, Transport, UpdateHandler};

@@ -298,6 +298,31 @@ certificate out of the saved session, which is then about 150 bytes rather than
 1.3 KB; nothing reads the certificate after the handshake. The saved bytes hold
 the session's master secret, so keep them in RTC memory, not flash or a log.
 
+### TLS 1.3
+
+ESP-IDF builds without TLS 1.3, so a device speaks 1.2 to any server. To allow
+1.3, in `sdkconfig.defaults`:
+
+```
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
+```
+
+ESP-IDF won't build TLS 1.3 without the second line. That undoes the saving
+above for TLS 1.2: a saved 1.2 session carries the server's certificate again.
+A saved 1.3 session never does, since mbedTLS writes only the resumption secret
+and the server's ticket, so its size depends on that ticket.
+
+With both lines, a device asks for 1.3 and falls back to 1.2 if the server
+doesn't speak it. `Config::tls_version` can hold it to one version.
+`TlsVersion::Tls13` on a build without TLS 1.3 refuses to connect, where
+esp-tls would quietly use 1.2.
+
+Resumption works the same from the application's side. The difference is
+inside: the server sends a 1.3 ticket after the handshake rather than in it, so
+it is saved once the first read on the connection has taken it in. A connection
+that ends before reading anything leaves the session it was offered.
+
 Nothing is lost when the server has forgotten the session -- restarted, evicted
 it, or is another node behind a load balancer: the handshake is a full one and
 its session replaces the old.
