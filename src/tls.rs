@@ -7,6 +7,9 @@
 //! after one. This makes the same esp-tls calls with the session in a
 //! [`TlsSession`] the application can reach. See that type for why it matters.
 //!
+//! TLS 1.3 is the one place it goes further: a 1.3 session ticket arrives
+//! after the handshake, so it is saved from a later read, not at connect.
+//!
 //! It is otherwise a copy of `esp_transport_ssl`'s client path: the same
 //! esp-tls connect, the same `select` polls, the same mapping of esp-tls
 //! results onto the `esp_tcp_transport_err_t` values the websocket layer reads.
@@ -24,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use esp_idf_svc::sys;
 
+use crate::config::TlsVersion;
 use crate::error::Error;
 #[cfg(esp_idf_esp_tls_client_session_tickets)]
 use crate::tls_session::Handshake;
@@ -36,6 +40,7 @@ pub(crate) struct Settings {
     pub server_ca: Option<&'static CStr>,
     /// PEM client certificate and key, for mTLS.
     pub client_certificate: Option<(&'static CStr, &'static CStr)>,
+    pub version: TlsVersion,
     pub session: TlsSession,
 }
 
@@ -49,6 +54,10 @@ struct Context {
     /// The session being offered, which has to outlive the handshake.
     #[cfg(esp_idf_esp_tls_client_session_tickets)]
     offered: Option<LoadedSession>,
+    /// A TLS 1.3 handshake whose ticket hasn't come yet: what it was, for
+    /// when the ticket is stored.
+    #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+    ticket_due: Option<Handshake>,
 }
 
 /// A new transport, owned by the caller until `esp_transport_destroy`, and
@@ -56,6 +65,16 @@ struct Context {
 pub(crate) fn transport(
     settings: Settings,
 ) -> Result<(sys::esp_transport_handle_t, Stopper), Error> {
+    // esp-tls would log a warning and connect with 1.2 anyway, which is not
+    // what was asked for, and the warning is easy to miss on a device.
+    if settings.version == TlsVersion::Tls13 && !cfg!(esp_idf_mbedtls_ssl_proto_tls1_3) {
+        return Err(Error::Transport(
+            "TLS 1.3 asked for, but this build has no TLS 1.3 \
+             (CONFIG_MBEDTLS_SSL_PROTO_TLS1_3)"
+                .into(),
+        ));
+    }
+
     let t = unsafe { sys::esp_transport_init() };
     if t.is_null() {
         return Err(Error::Transport("no memory for the TLS transport".into()));
@@ -70,6 +89,8 @@ pub(crate) fn transport(
         stopping: Arc::clone(&stopping),
         #[cfg(esp_idf_esp_tls_client_session_tickets)]
         offered: None,
+        #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+        ticket_due: None,
     }));
 
     // Both only fail on a null handle, which was ruled out above. From here
@@ -106,6 +127,12 @@ fn base_config(settings: &Settings) -> sys::esp_tls_cfg_t {
         None => cfg.crt_bundle_attach = Some(sys::esp_crt_bundle_attach),
     }
 
+    cfg.tls_version = match settings.version {
+        TlsVersion::Any => sys::esp_tls_proto_ver_t_ESP_TLS_VER_ANY,
+        TlsVersion::Tls12 => sys::esp_tls_proto_ver_t_ESP_TLS_VER_TLS_1_2,
+        TlsVersion::Tls13 => sys::esp_tls_proto_ver_t_ESP_TLS_VER_TLS_1_3,
+    };
+
     // PEM lengths count the NUL, which mbedTLS uses to tell PEM from DER.
     if let Some((certificate, key)) = settings.client_certificate {
         cfg.__bindgen_anon_3.clientcert_buf = certificate.as_ptr().cast();
@@ -131,6 +158,10 @@ impl Context {
         #[cfg(esp_idf_esp_tls_client_session_tickets)]
         {
             self.offered = None;
+        }
+        #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+        {
+            self.ticket_due = None;
         }
     }
 }
@@ -186,6 +217,19 @@ unsafe extern "C" fn connect(
     }
     ctx.tls = tls;
 
+    if let Some(protocol) = protocol(tls) {
+        ctx.settings.session.negotiated(protocol);
+    }
+
+    // Known now, kept later: see `read`.
+    #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+    if is_tls13(tls) {
+        let handshake = tls13_handshake(tls, offered.is_some());
+        ctx.settings.session.record(handshake);
+        ctx.ticket_due = Some(handshake);
+        return 0;
+    }
+
     #[cfg(esp_idf_esp_tls_client_session_tickets)]
     if let Some(fresh) = save_session(tls) {
         // On resumption mbedTLS keeps the offered session exactly as it was,
@@ -231,6 +275,18 @@ unsafe extern "C" fn read(
     }
 
     let n = sys::esp_tls_conn_read(ctx.tls, buffer.cast(), len as usize) as c_int;
+
+    // esp-tls takes a TLS 1.3 ticket in inside the read, and holds it for
+    // `esp_tls_get_client_session`. The server sends it straight after the
+    // handshake, so it is here by the first read or two.
+    #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+    if let Some(handshake) = ctx.ticket_due {
+        if let Some(ticket) = save_session(ctx.tls) {
+            ctx.settings.session.store(ticket, handshake);
+            ctx.ticket_due = None;
+        }
+    }
+
     if n == sys::MBEDTLS_ERR_SSL_WANT_READ || n == sys::MBEDTLS_ERR_SSL_TIMEOUT {
         sys::esp_tcp_transport_err_t_ERR_TCP_TRANSPORT_CONNECTION_TIMEOUT
     } else if n < 0 {
@@ -444,12 +500,12 @@ impl Drop for LoadedSession {
     }
 }
 
-/// The session the handshake just made, as bytes.
+/// The connection's session, as bytes.
 ///
-/// TLS 1.2 lets mbedTLS export a session once per connection, so this is
-/// called once, straight after the handshake. (TLS 1.3 sends its tickets
-/// later, after the handshake; NervesHub speaks 1.2 to devices unless
-/// configured otherwise, and a 1.3 connection simply saves nothing here.)
+/// TLS 1.2 lets mbedTLS export a session once per connection, so for 1.2 this
+/// is called once, straight after the handshake. A TLS 1.3 session is the
+/// ticket the server sends after the handshake; until a read has taken one
+/// in, esp-tls has nothing to give and this returns `None`.
 #[cfg(esp_idf_esp_tls_client_session_tickets)]
 unsafe fn save_session(tls: *mut sys::esp_tls_t) -> Option<Vec<u8>> {
     let session = sys::esp_tls_get_client_session(tls);
@@ -473,4 +529,39 @@ unsafe fn save_session(tls: *mut sys::esp_tls_t) -> Option<Vec<u8>> {
         bytes.truncate(len);
         bytes
     })
+}
+
+/// The protocol the handshake settled on, as mbedTLS names it.
+unsafe fn protocol(tls: *mut sys::esp_tls_t) -> Option<String> {
+    let ssl = sys::esp_tls_get_ssl_context(tls) as *const sys::mbedtls_ssl_context;
+    if ssl.is_null() {
+        return None;
+    }
+    let name = sys::mbedtls_ssl_get_version(ssl);
+    (!name.is_null()).then(|| CStr::from_ptr(name).to_string_lossy().into_owned())
+}
+
+/// Whether the connection settled on TLS 1.3.
+#[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+unsafe fn is_tls13(tls: *mut sys::esp_tls_t) -> bool {
+    let ssl = sys::esp_tls_get_ssl_context(tls) as *const sys::mbedtls_ssl_context;
+    !ssl.is_null() && CStr::from_ptr(sys::mbedtls_ssl_get_version(ssl)).to_bytes() == b"TLSv1.3"
+}
+
+/// Whether a TLS 1.3 handshake resumed the offered session.
+///
+/// The TLS 1.2 test -- the session's bytes unchanged -- can't work here: each
+/// connection gets a new ticket either way. But a saved 1.3 session carries no
+/// certificate (mbedTLS doesn't write one), and a resumed handshake sends
+/// none, so afterwards mbedTLS has no peer certificate; after a full handshake
+/// it has the server's. TLS 1.3 needs `CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE`
+/// in ESP-IDF, so a full handshake always keeps it.
+#[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
+unsafe fn tls13_handshake(tls: *mut sys::esp_tls_t, offered: bool) -> Handshake {
+    let ssl = sys::esp_tls_get_ssl_context(tls) as *const sys::mbedtls_ssl_context;
+    if offered && !ssl.is_null() && sys::mbedtls_ssl_get_peer_cert(ssl).is_null() {
+        Handshake::Resumed
+    } else {
+        Handshake::Full
+    }
 }

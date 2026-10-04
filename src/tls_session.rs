@@ -6,6 +6,12 @@
 //! round trip. Over LTE-M that is the difference between a 6-12 second
 //! handshake and a half-second one, on every connection.
 //!
+//! TLS 1.3 resumes from a ticket instead, which the server sends after the
+//! handshake rather than in it. It is kept once a read on the connection has
+//! taken it in, so a connection that closes before reading anything leaves
+//! the session it was offered. A saved TLS 1.3 session is mostly that
+//! ticket, so its size is the server's choice.
+//!
 //! Within one boot this is automatic: the agent reconnects with the same
 //! [`Config`](crate::Config), and the session the last handshake left here is
 //! offered on the next. A device that deep-sleeps between reports loses its
@@ -67,6 +73,8 @@ pub struct TlsSession {
 struct Inner {
     saved: Option<Vec<u8>>,
     last: Option<Handshake>,
+    /// mbedTLS's name for the last connection's protocol, e.g. "TLSv1.3".
+    protocol: Option<String>,
 }
 
 impl TlsSession {
@@ -100,6 +108,18 @@ impl TlsSession {
         self.lock().last
     }
 
+    /// The last connection's protocol as mbedTLS names it ("TLSv1.2",
+    /// "TLSv1.3"). For the log line that says how a connection went.
+    #[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
+    pub(crate) fn last_protocol(&self) -> Option<String> {
+        self.lock().protocol.clone()
+    }
+
+    #[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
+    pub(crate) fn negotiated(&self, protocol: String) {
+        self.lock().protocol = Some(protocol);
+    }
+
     /// Drop the session, so the next handshake is a full one.
     pub fn forget(&self) {
         self.lock().saved = None;
@@ -111,6 +131,16 @@ impl TlsSession {
         let mut inner = self.lock();
         inner.saved = Some(session);
         inner.last = Some(handshake);
+    }
+
+    /// What a handshake was, before there is a session to keep from it: a
+    /// TLS 1.3 ticket comes later, and [`store`](Self::store) keeps it then.
+    #[cfg_attr(
+        not(all(target_os = "espidf", esp_idf_mbedtls_ssl_proto_tls1_3)),
+        allow(dead_code)
+    )]
+    pub(crate) fn record(&self, handshake: Handshake) {
+        self.lock().last = Some(handshake);
     }
 
     // Nothing that holds the lock can panic, but a poisoned slot is still just
@@ -155,6 +185,26 @@ mod tests {
 
         assert_eq!(app.saved(), Some(b"new".to_vec()));
         assert_eq!(app.last_handshake(), Some(Handshake::Full));
+    }
+
+    // A TLS 1.3 handshake is known before its ticket arrives, and until then
+    // the session it was offered is the one to offer again.
+    #[test]
+    fn a_handshake_recorded_before_its_ticket_keeps_the_offered_session() {
+        let session = TlsSession::restore(b"offered");
+        session.record(Handshake::Resumed);
+
+        assert_eq!(session.last_handshake(), Some(Handshake::Resumed));
+        assert_eq!(session.saved(), Some(b"offered".to_vec()));
+    }
+
+    #[test]
+    fn the_negotiated_protocol_is_kept_for_the_log() {
+        let session = TlsSession::new();
+        assert_eq!(session.last_protocol(), None);
+
+        session.negotiated("TLSv1.3".into());
+        assert_eq!(session.last_protocol().as_deref(), Some("TLSv1.3"));
     }
 
     #[test]

@@ -157,6 +157,7 @@ impl WebSocketTransport {
             let (base, stopper) = tls::transport(tls::Settings {
                 server_ca: config.server_ca,
                 client_certificate,
+                version: config.tls_version,
                 session: config.tls_session.clone(),
             })?;
             partial.base = base;
@@ -251,9 +252,10 @@ impl WebSocketTransport {
         }
 
         if config.use_tls {
+            let protocol = config.tls_session.last_protocol().unwrap_or_default();
             match config.tls_session.last_handshake() {
-                Some(crate::Handshake::Resumed) => log::info!("TLS session resumed"),
-                Some(crate::Handshake::Full) => log::info!("TLS full handshake"),
+                Some(crate::Handshake::Resumed) => log::info!("TLS session resumed ({protocol})"),
+                Some(crate::Handshake::Full) => log::info!("TLS full handshake ({protocol})"),
                 None => {}
             }
         }

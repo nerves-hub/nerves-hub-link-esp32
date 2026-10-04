@@ -85,6 +85,24 @@ fn leak_pem(mut bytes: Vec<u8>, what: &str) -> Result<&'static CStr, Error> {
     Ok(Box::leak(cstring.into_boxed_c_str()))
 }
 
+/// The TLS versions a connection may use.
+///
+/// TLS 1.3 has to be built in, with `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`, and
+/// ESP-IDF only allows that with `CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y`.
+/// See the README's "TLS 1.3" for what that costs a saved TLS 1.2 session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsVersion {
+    /// Whatever the build has, at the highest version the server agrees to.
+    /// With TLS 1.3 built in, that is 1.3 from a server that speaks it.
+    #[default]
+    Any,
+    /// TLS 1.2 only.
+    Tls12,
+    /// TLS 1.3 only. A build without it refuses to connect, where esp-tls
+    /// would quietly carry on with 1.2.
+    Tls13,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Host only — no scheme, no path. e.g. `devices.nerves-hub.org`.
@@ -124,6 +142,10 @@ pub struct Config {
     /// Which extensions to offer. None by default — an extension sends data an
     /// operator may not expect a device to send, so it is asked for explicitly.
     pub extensions: Enabled,
+    /// Which TLS versions a connection may use. [`TlsVersion::Any`] unless
+    /// asked: the build decides what there is (ESP-IDF leaves TLS 1.3 out
+    /// unless it is turned on), and the server picks the highest both have.
+    pub tls_version: TlsVersion,
     /// The TLS session the next connection offers to resume, and where each
     /// handshake leaves the one after it. Empty to start with, which still
     /// resumes across reconnects within a boot; a device that sleeps restores
@@ -149,6 +171,7 @@ impl Config {
             reconnect_backoff_secs: vec![1, 2, 5, 10, 30, 60],
             progress_step_percent: 5,
             extensions: Enabled::none(),
+            tls_version: TlsVersion::Any,
             tls_session: TlsSession::new(),
             serializer: Serializer::Json,
         }
