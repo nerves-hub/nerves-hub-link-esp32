@@ -27,7 +27,9 @@ use crate::error::Error;
 use crate::install::HttpStream;
 
 pub struct EspHttpStream {
-    connection: EspHttpConnection,
+    configuration: Configuration,
+    /// `None` after a failed open, until the next opens a fresh one.
+    connection: Option<EspHttpConnection>,
 }
 
 impl EspHttpStream {
@@ -45,38 +47,73 @@ impl EspHttpStream {
         let connection =
             EspHttpConnection::new(&configuration).map_err(|e| Error::Download(e.to_string()))?;
 
-        Ok(Self { connection })
+        Ok(Self {
+            configuration,
+            connection: Some(connection),
+        })
+    }
+
+    fn request(&mut self, url: &str) -> Result<Option<u64>, Error> {
+        let connection = match self.connection.take() {
+            Some(connection) => connection,
+            None => EspHttpConnection::new(&self.configuration)
+                .map_err(|e| Error::Download(e.to_string()))?,
+        };
+        let connection = self.connection.insert(connection);
+
+        connection
+            .initiate_request(Method::Get, url, &[])
+            .map_err(|e| Error::Download(e.to_string()))?;
+
+        connection
+            .initiate_response()
+            .map_err(|e| Error::Download(e.to_string()))?;
+
+        let status = connection.status();
+
+        // Redirects are followed by the client, so anything non-2xx here is a
+        // real failure — most often an expired pre-signed URL, which no retry
+        // will mend, or storage that is busy, which one might.
+        if !(200..300).contains(&status) {
+            return Err(Error::DownloadStatus {
+                status,
+                // Only the delta-seconds form. The date form needs a clock
+                // the device may not have set, and a retry without it only
+                // falls back to the usual backoff.
+                retry_after_secs: connection
+                    .header("Retry-After")
+                    .and_then(|value| value.trim().parse::<u64>().ok()),
+            });
+        }
+
+        Ok(connection
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok()))
     }
 }
 
 impl HttpStream for EspHttpStream {
     fn open(&mut self, url: &str) -> Result<Option<u64>, Error> {
-        self.connection
-            .initiate_request(Method::Get, url, &[])
-            .map_err(|e| Error::Download(e.to_string()))?;
+        let opened = self.request(url);
 
-        self.connection
-            .initiate_response()
-            .map_err(|e| Error::Download(e.to_string()))?;
-
-        let status = self.connection.status();
-
-        // Redirects are followed by the client, so anything non-2xx here is a
-        // real failure — most often an expired pre-signed URL.
-        if !(200..300).contains(&status) {
-            return Err(Error::Download(format!(
-                "firmware download returned HTTP {status}"
-            )));
+        // A connection that failed is not used again. One that failed between
+        // sending the request and reading the response is left mid-request,
+        // where esp-idf-svc panics rather than start another; and one that
+        // answered with an error may be a keep-alive to the very backend that
+        // sent it. The next open starts from a fresh one -- and dropping this
+        // one now frees its TLS session's memory for the wait in between.
+        if opened.is_err() {
+            self.connection = None;
         }
 
-        Ok(self
-            .connection
-            .header("Content-Length")
-            .and_then(|value| value.parse::<u64>().ok()))
+        opened
     }
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        esp_idf_svc::io::Read::read(&mut self.connection, buf)
-            .map_err(|e| Error::Download(e.to_string()))
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(Error::Download("read before a successful open".into()));
+        };
+
+        esp_idf_svc::io::Read::read(connection, buf).map_err(|e| Error::Download(e.to_string()))
     }
 }

@@ -16,6 +16,14 @@ pub enum Error {
     Identity(String),
     /// Downloading the image failed.
     Download(String),
+    /// The firmware URL answered with an error status. Apart from `Download`
+    /// so that a server that is busy for now (`503`, `429`) can be told from
+    /// one that will never serve the image (`403` for an expired URL, `404`).
+    DownloadStatus {
+        status: u16,
+        /// The server's `Retry-After`, when it gave one in seconds.
+        retry_after_secs: Option<u64>,
+    },
     /// Writing to the inactive OTA slot, or activating it, failed.
     Ota(String),
     /// The downloaded image did not match the checksum NervesHub advertised.
@@ -44,6 +52,9 @@ impl fmt::Display for Error {
             Error::Metadata(msg) => write!(f, "could not read firmware metadata: {msg}"),
             Error::Identity(msg) => write!(f, "device identity unavailable: {msg}"),
             Error::Download(msg) => write!(f, "download failed: {msg}"),
+            Error::DownloadStatus { status, .. } => {
+                write!(f, "download failed: firmware download returned HTTP {status}")
+            }
             Error::Ota(msg) => write!(f, "ota failed: {msg}"),
             Error::ChecksumMismatch { expected, actual } => {
                 write!(f, "checksum mismatch: expected {expected}, got {actual}")
@@ -97,6 +108,21 @@ mod tests {
         assert_eq!(
             err.status_reason(),
             "checksum mismatch: expected AAAA, got BBBB"
+        );
+    }
+
+    // The reason NervesHub records reads as it did before the status had a
+    // variant of its own.
+    #[test]
+    fn a_download_status_names_the_status() {
+        let err = Error::DownloadStatus {
+            status: 503,
+            retry_after_secs: Some(30),
+        };
+
+        assert_eq!(
+            err.status_reason(),
+            "download failed: firmware download returned HTTP 503"
         );
     }
 

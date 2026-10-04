@@ -1111,6 +1111,24 @@ impl<P: Platform, H: UpdateHandler> crate::install::Progress for Pump<'_, P, H> 
         self.handler.progress(stage, percent);
         self.link.send_progress(self.transport, stage, percent)
     }
+
+    // The time between attempts goes as the time between chunks does:
+    // heartbeats and logs keep going out, and a heartbeat that can't be sent
+    // ends the wait and the download with it.
+    fn wait(&mut self, duration: Duration) -> Result<(), Error> {
+        let until = self.platform.now_ms() + duration.as_millis() as u64;
+
+        loop {
+            self.tick()?;
+
+            let now = self.platform.now_ms();
+            if now >= until {
+                return Ok(());
+            }
+
+            self.platform.sleep(Duration::from_millis((until - now).min(1_000)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1183,10 +1201,20 @@ mod tests {
         }
     }
 
-    struct FakeHttp(Vec<u8>, usize);
+    /// The image, how much of it has been read, and how many more opens
+    /// answer `503`.
+    struct FakeHttp(Vec<u8>, usize, usize);
 
     impl HttpStream for FakeHttp {
         fn open(&mut self, _url: &str) -> Result<Option<u64>, Error> {
+            if self.2 > 0 {
+                self.2 -= 1;
+                return Err(Error::DownloadStatus {
+                    status: 503,
+                    retry_after_secs: None,
+                });
+            }
+
             Ok(Some(self.0.len() as u64))
         }
 
@@ -1218,6 +1246,8 @@ mod tests {
         incoming: Vec<Vec<Incoming>>,
         pending: PendingVerify,
         image: Vec<u8>,
+        /// How many opens of the image answer `503` before one succeeds.
+        busy_opens: usize,
         connect_failures: usize,
         clock_ms: u64,
         /// How far the fake clock jumps per reading. A download calls `now_ms`
@@ -1258,7 +1288,7 @@ mod tests {
         }
 
         fn http(&mut self) -> Result<Self::Http, Error> {
-            Ok(FakeHttp(self.image.clone(), 0))
+            Ok(FakeHttp(self.image.clone(), 0, self.busy_opens))
         }
 
         fn begin_update(&mut self) -> Result<Self::Sink, Error> {
@@ -1338,6 +1368,7 @@ mod tests {
             incoming,
             pending: PendingVerify::No,
             image: vec![],
+            busy_opens: 0,
             connect_failures: 0,
             clock_ms: 0,
             clock_step_ms: 1,
@@ -1813,6 +1844,49 @@ mod tests {
         let events = events(&shared);
         assert!(events.contains(&"update_progress".to_string()));
         assert!(events.contains(&"rebooting".to_string()));
+    }
+
+    // Storage that is busy for a moment shouldn't cost an update. The agent
+    // waits it out with the connection kept up, and the download goes ahead.
+    #[test]
+    fn a_busy_download_is_waited_out_and_installed() {
+        let image = vec![7u8; 4096];
+
+        let update = json!({
+            "update_available": true,
+            "firmware_url": "https://example.test/fw.bin",
+            "firmware_meta": {"uuid": "uuid-1"},
+            "size": image.len(),
+            "checksum": sha256_upper(&image)
+        });
+
+        let mut plat = platform(vec![vec![join_reply(update)]]);
+        plat.image = image;
+        plat.busy_opens = 2;
+        let shared = Rc::clone(&plat.shared);
+
+        let mut config = config();
+        config.heartbeat_interval_secs = 10;
+
+        let mut agent = Agent::new(config, metadata(), plat, AlwaysApply);
+        assert_eq!(agent.run().unwrap(), Stopped::Rebooting);
+
+        assert_eq!(shared.borrow().commits, 1);
+
+        // Five seconds and fifteen, less the fake clock's steps between them.
+        let waited: Duration = shared.borrow().slept.iter().sum();
+        assert!(waited >= Duration::from_secs(19), "waited {waited:?}");
+
+        let events = events(&shared);
+        let first_progress = events
+            .iter()
+            .position(|event| event == "update_progress")
+            .expect("no progress was reported");
+
+        assert!(
+            events[..first_progress].contains(&"heartbeat".to_string()),
+            "no heartbeat while waiting: {events:?}"
+        );
     }
 
     // A bad download must not reboot: `install` leaves the running image

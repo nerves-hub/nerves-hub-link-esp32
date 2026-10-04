@@ -9,6 +9,8 @@
 //! image — run under `cargo test` on the host. The device supplies
 //! `EspHttpStream` and `OtaWriter`; the tests supply fakes.
 
+use core::time::Duration;
+
 use crate::checksum::{self, Sha256};
 use crate::error::Error;
 use crate::update::{ProgressThrottle, Stage, UpdatePayload};
@@ -16,6 +18,23 @@ use crate::update::{ProgressThrottle, Stage, UpdatePayload};
 /// Read size. Large enough that flash writes are not dominated by per-call
 /// overhead, small enough to sit comfortably in RAM alongside TLS buffers.
 pub const CHUNK_SIZE: usize = 4096;
+
+/// The waits before each retry of a download that couldn't start: three
+/// retries, the last a little over a minute after the first attempt.
+///
+/// Long enough for storage that answered `503` to have recovered, or a cell
+/// that dropped the connection to have it back; short enough that a device
+/// gives up and says so while whoever pushed the update is still watching.
+const RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
+
+/// The longest a server's `Retry-After` is waited for. Asking for longer is
+/// treated as asking for this, and if that doesn't do, the failure goes to
+/// NervesHub to offer the update again later.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
 
 /// A GET that can be read incrementally.
 pub trait HttpStream {
@@ -53,6 +72,16 @@ pub trait Progress {
 
     /// When progress crosses the reporting step.
     fn report(&mut self, stage: Stage, percent: u8) -> Result<(), Error>;
+
+    /// Before another try at a download that couldn't start, for `duration`.
+    ///
+    /// The default sleeps. The agent instead spends the time as it spends a
+    /// download's, sending heartbeats and logs, and as with `tick`, returning
+    /// an error abandons the download.
+    fn wait(&mut self, duration: Duration) -> Result<(), Error> {
+        std::thread::sleep(duration);
+        Ok(())
+    }
 }
 
 impl<F> Progress for F
@@ -128,7 +157,7 @@ where
     S: ImageSink,
     P: Progress,
 {
-    let content_length = http.open(url)?;
+    let content_length = open(url, http, on_progress)?;
 
     // Prefer what NervesHub told us over what the CDN claims: the deployment's
     // size is the value the checksum belongs to.
@@ -201,17 +230,76 @@ where
     })
 }
 
+/// Open the image's URL, trying again if it couldn't be opened for a reason
+/// that may pass.
+///
+/// Only opening is retried. Once bytes have reached the slot, starting again
+/// means downloading the image from the top (see "Resumable downloads" in the
+/// README), and whether that is worth it is NervesHub's call: the failure is
+/// reported, and the deployment offers the update again.
+///
+/// The error returned is the last attempt's, so what NervesHub records is
+/// what was still wrong when the device gave up.
+fn open<H, P>(url: &str, http: &mut H, on_progress: &mut P) -> Result<Option<u64>, Error>
+where
+    H: HttpStream,
+    P: Progress,
+{
+    let mut waits = RETRY_WAITS.iter();
+
+    loop {
+        let err = match http.open(url) {
+            Ok(content_length) => return Ok(content_length),
+            Err(err) => err,
+        };
+
+        let Some(&backoff) = waits.next().filter(|_| worth_retrying(&err)) else {
+            return Err(err);
+        };
+
+        // The server's word as a minimum, not instead of the backoff: a
+        // `Retry-After: 0` from storage that is still failing would otherwise
+        // spend every retry in a second.
+        let wait = match err {
+            Error::DownloadStatus {
+                retry_after_secs: Some(secs),
+                ..
+            } => backoff.max(Duration::from_secs(secs).min(RETRY_AFTER_MAX)),
+            _ => backoff,
+        };
+
+        log::warn!("{err}; trying again in {} s", wait.as_secs());
+        on_progress.wait(wait)?;
+    }
+}
+
+/// Whether a download that couldn't start may start if tried again.
+fn worth_retrying(err: &Error) -> bool {
+    match err {
+        // No connection, no address, a handshake or a response that didn't
+        // arrive: the network, which comes and goes.
+        Error::Download(_) => true,
+        // Timed out, rate-limited, or the server failing. Not a `403` (the
+        // pre-signed URL expired, and a retry asks with the same one) or a
+        // `404`, which no amount of asking will change.
+        Error::DownloadStatus { status, .. } => matches!(status, 408 | 429 | 500..=599),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Serves a fixed body, optionally failing partway through.
+    /// Serves a fixed body, optionally failing to open or partway through.
     struct FakeHttp {
         body: Vec<u8>,
         position: usize,
         content_length: Option<u64>,
         fail_after: Option<usize>,
+        /// What the next opens fail with, in order, before one succeeds.
+        open_failures: Vec<Error>,
         opened: Vec<String>,
     }
 
@@ -222,8 +310,14 @@ mod tests {
                 position: 0,
                 content_length: Some(body.len() as u64),
                 fail_after: None,
+                open_failures: vec![],
                 opened: vec![],
             }
+        }
+
+        fn failing_to_open(mut self, errors: Vec<Error>) -> Self {
+            self.open_failures = errors;
+            self
         }
 
         fn without_content_length(mut self) -> Self {
@@ -240,6 +334,11 @@ mod tests {
     impl HttpStream for FakeHttp {
         fn open(&mut self, url: &str) -> Result<Option<u64>, Error> {
             self.opened.push(url.to_string());
+
+            if !self.open_failures.is_empty() {
+                return Err(self.open_failures.remove(0));
+            }
+
             Ok(self.content_length)
         }
 
@@ -326,6 +425,41 @@ mod tests {
         });
 
         (result, seen)
+    }
+
+    /// Notes each wait between attempts, and takes no time over it.
+    #[derive(Default)]
+    struct Watcher {
+        waits: Vec<Duration>,
+        /// The connection to NervesHub has gone, as a heartbeat would find.
+        gone: bool,
+    }
+
+    impl Progress for Watcher {
+        fn report(&mut self, _stage: Stage, _percent: u8) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn wait(&mut self, duration: Duration) -> Result<(), Error> {
+            self.waits.push(duration);
+
+            if self.gone {
+                return Err(Error::Transport("link dropped".into()));
+            }
+
+            Ok(())
+        }
+    }
+
+    fn status(status: u16, retry_after_secs: Option<u64>) -> Error {
+        Error::DownloadStatus {
+            status,
+            retry_after_secs,
+        }
+    }
+
+    fn secs(waits: &[u64]) -> Vec<Duration> {
+        waits.iter().map(|&s| Duration::from_secs(s)).collect()
     }
 
     #[test]
@@ -484,6 +618,141 @@ mod tests {
         assert!(matches!(result, Err(Error::Download(_))));
         assert!(!sink.committed);
         assert!(!sink.aborted);
+    }
+
+    // Storage that is busy for a moment shouldn't cost an update.
+    #[test]
+    fn a_busy_server_is_asked_again_after_a_wait() {
+        let body = image();
+        let update = update_for(&body, Some(sha256_upper(&body)));
+        let mut http =
+            FakeHttp::new(&body).failing_to_open(vec![status(503, None), status(503, None)]);
+        let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(http.opened.len(), 3);
+        assert_eq!(watcher.waits, secs(&[5, 15]));
+        assert_eq!(sink.written, body);
+        assert!(sink.committed);
+    }
+
+    #[test]
+    fn a_connection_that_fails_is_tried_again() {
+        let body = image();
+        let update = update_for(&body, Some(sha256_upper(&body)));
+        let mut http = FakeHttp::new(&body)
+            .failing_to_open(vec![Error::Download("ESP_ERR_HTTP_CONNECT".into())]);
+        let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(watcher.waits, secs(&[5]));
+        assert!(sink.committed);
+    }
+
+    // Longer than the backoff when the server asks for longer; never past the
+    // cap; and never shorter than the backoff, even when it asks for nothing.
+    #[test]
+    fn retry_after_is_waited_for_within_limits() {
+        let body = image();
+        let update = update_for(&body, Some(sha256_upper(&body)));
+        let mut http = FakeHttp::new(&body).failing_to_open(vec![
+            status(429, Some(30)),
+            status(503, Some(3_600)),
+            status(503, Some(0)),
+        ]);
+        let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(watcher.waits, secs(&[30, 120, 45]));
+    }
+
+    // An expired pre-signed URL is asked for again with the same URL, so it
+    // fails the same way; a missing image stays missing.
+    #[test]
+    fn a_refusal_is_not_asked_again() {
+        for refused in [403, 404] {
+            let body = image();
+            let update = update_for(&body, None);
+            let mut http = FakeHttp::new(&body).failing_to_open(vec![status(refused, None)]);
+            let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+            let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+            assert!(
+                matches!(result, Err(Error::DownloadStatus { status, .. }) if status == refused),
+                "{result:?}"
+            );
+            assert_eq!(http.opened.len(), 1);
+            assert!(watcher.waits.is_empty());
+            assert!(sink.aborted);
+        }
+    }
+
+    // What NervesHub hears about is what was still wrong at the end.
+    #[test]
+    fn retries_run_out_with_the_last_error() {
+        let body = image();
+        let update = update_for(&body, None);
+        let mut http = FakeHttp::new(&body).failing_to_open(vec![
+            Error::Download("ESP_ERR_HTTP_CONNECT".into()),
+            status(503, None),
+            status(503, None),
+            status(502, None),
+            status(503, None),
+        ]);
+        let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(
+            matches!(result, Err(Error::DownloadStatus { status: 502, .. })),
+            "{result:?}"
+        );
+        assert_eq!(http.opened.len(), 4);
+        assert_eq!(watcher.waits, secs(&[5, 15, 45]));
+        assert!(sink.aborted);
+        assert!(!sink.committed);
+    }
+
+    // Once bytes are in the slot, another try starts the image from the top:
+    // NervesHub's call, not this one's.
+    #[test]
+    fn a_failure_partway_is_not_retried() {
+        let body = image();
+        let update = update_for(&body, None);
+        let mut http = FakeHttp::new(&body).failing_after(1000);
+        let (mut sink, mut watcher) = (FakeSink::default(), Watcher::default());
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(matches!(result, Err(Error::Download(_))), "{result:?}");
+        assert_eq!(http.opened.len(), 1);
+        assert!(watcher.waits.is_empty());
+        assert!(sink.aborted);
+    }
+
+    #[test]
+    fn losing_the_connection_while_waiting_ends_the_download() {
+        let body = image();
+        let update = update_for(&body, None);
+        let mut http = FakeHttp::new(&body).failing_to_open(vec![status(503, None)]);
+        let mut sink = FakeSink::default();
+        let mut watcher = Watcher {
+            gone: true,
+            ..Default::default()
+        };
+
+        let result = install(&update, &mut http, &mut sink, 5, &mut watcher);
+
+        assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
+        assert_eq!(http.opened.len(), 1);
+        assert!(sink.aborted);
     }
 
     // A failure to report progress (the link dropped) should stop the install

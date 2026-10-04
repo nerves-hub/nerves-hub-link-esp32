@@ -186,6 +186,15 @@ gone. Nothing is read during one, and nothing needs to be: frames arriving
 queue on the transport and are handled when it finishes, so a console command
 typed mid-update is answered late rather than lost.
 
+A download that can't start is tried again, three more times, 5, 15 and 45 s
+apart, or after the server's `Retry-After` when that is longer (up to two
+minutes). That covers a connection that fails, a response that never comes, and
+a `408`, `429` or `5xx`. It doesn't cover a `403`, which is an expired pre-signed
+URL that asking again only repeats, or a `404`. The waits are spent as the
+download is, with heartbeats and logs going out. Once any of the image has been
+written nothing is retried: the failure goes to NervesHub, whose deployment
+offers the update again.
+
 ## Devices that sleep
 
 `run` holds the connection for as long as the device is up, and returns only
@@ -609,8 +618,9 @@ channel, are declined out loud rather than ignored.
 ## Not supported (yet)
 
 - **Resumable downloads**: NervesHub sends `partials_checksums` so an
-  interrupted transfer can be resumed and verified chunk-wise. This restarts
-  from zero instead.
+  interrupted transfer can be resumed and verified chunk-wise. Here one fails
+  and is reported, and NervesHub's next offer starts it from zero. Only a
+  download that never started is retried on the device.
 - **Updating the VM or bootloader**: application partition only.
 - **Support scripts** (`scripts/run` on the `device` channel), which ask a
   device to run supplied code. There is no interpreter here to run it in, and
