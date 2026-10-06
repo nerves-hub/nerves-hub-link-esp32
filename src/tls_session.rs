@@ -32,6 +32,24 @@
 //! }
 //! ```
 //!
+//! # TLS 1.3 tickets across a deep sleep
+//!
+//! mbedTLS dates a TLS 1.3 ticket with `mbedtls_ms_time()`, and before offering
+//! one checks that its age -- now, less that date -- is neither negative nor
+//! past the ticket's lifetime. On ESP-IDF that clock counts from boot, and a
+//! wake from deep sleep is a boot. So after a sleep the saved date was taken in
+//! a boot that has ended, the age comes out negative unless this wake connects
+//! later after boot than the last one took its ticket, and mbedTLS drops the
+//! ticket as expired: a full handshake, about 4.5 KB more from the server, on
+//! most reports.
+//!
+//! So a saved TLS 1.3 session carries the ticket's date on the wall clock,
+//! which ESP-IDF keeps through deep sleep, and is moved back onto mbedTLS's
+//! clock, keeping its age, when it is offered (see [`rebase`]). Bytes saved
+//! before this hold a date on the old clock, read as long ago: they are
+//! offered as expired once, and the full handshake that follows leaves bytes
+//! in the new form.
+//!
 //! # It is a secret
 //!
 //! The saved bytes hold the session's master secret: anyone with them can
@@ -160,9 +178,62 @@ impl fmt::Debug for TlsSession {
     }
 }
 
+/// A time `at` on one clock, moved to another clock: the same age before
+/// `to_now` as it had before `from_now`.
+///
+/// For a TLS 1.3 ticket's date, between mbedTLS's clock, which restarts at
+/// every boot, and the wall clock, which goes on through deep sleep; see the
+/// module docs. An age that comes out negative -- the wall clock set back since
+/// the ticket came -- is taken as zero. The server judges a ticket's age by
+/// its own clock, so the most a ticket offered as new can cost is a refusal.
+#[cfg_attr(
+    not(all(
+        target_os = "espidf",
+        esp_idf_esp_tls_client_session_tickets,
+        esp_idf_mbedtls_ssl_proto_tls1_3,
+        esp_idf_mbedtls_have_time
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn rebase(at: i64, from_now: i64, to_now: i64) -> i64 {
+    let age = from_now.saturating_sub(at).max(0);
+    to_now.saturating_sub(age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-06 22:00:00 UTC, in milliseconds.
+    const WALL: i64 = 1_791_324_000_000;
+
+    // A ticket taken 41 s after one boot, saved, slept on for ten minutes, and
+    // offered 15 s after the next boot: ten minutes old, not -26 s.
+    #[test]
+    fn a_ticket_keeps_its_age_across_a_sleep() {
+        let saved = rebase(41_000, 45_000, WALL);
+        assert_eq!(saved, WALL - 4_000, "taken 4 s before it was saved");
+
+        let woken = WALL + 600_000 + 11_000;
+        let offered = rebase(saved, woken, 15_000);
+        assert_eq!(15_000 - offered, 615_000, "its age when offered");
+    }
+
+    #[test]
+    fn a_wall_clock_set_back_gives_a_new_ticket_not_a_negative_age() {
+        let saved = rebase(41_000, 45_000, WALL);
+        let offered = rebase(saved, WALL - 3_600_000, 15_000);
+        assert_eq!(offered, 15_000, "age zero");
+    }
+
+    // Saved by a version that kept mbedTLS's own clock: read as a wall-clock
+    // date it is decades old, so mbedTLS takes it as expired and the
+    // handshake is a full one, as it was before.
+    #[test]
+    fn bytes_from_before_read_as_long_expired() {
+        let offered = rebase(41_000, WALL, 15_000);
+        assert!(15_000 - offered > 7 * 24 * 3_600 * 1_000, "past any ticket lifetime");
+    }
 
     #[test]
     fn a_restored_session_is_offered_back_unchanged() {

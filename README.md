@@ -332,6 +332,13 @@ inside: the server sends a 1.3 ticket after the handshake rather than in it, so
 it is saved once the first read on the connection has taken it in. A connection
 that ends before reading anything leaves the session it was offered.
 
+A 1.3 ticket also has an age, which mbedTLS checks before offering it, against
+a clock that on ESP-IDF restarts at every boot, deep-sleep wakes included. So a
+saved session holds the ticket's date on the wall clock, which ESP-IDF keeps
+through deep sleep, and goes back onto mbedTLS's clock when it is offered.
+Without that, a session saved before a sleep usually looked as if it came from
+the future, and mbedTLS dropped it: a full handshake on most reports.
+
 Nothing is lost when the server has forgotten the session -- restarted, evicted
 it, or is another node behind a load balancer: the handshake is a full one and
 its session replaces the old.
