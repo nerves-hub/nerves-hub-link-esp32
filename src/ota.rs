@@ -446,18 +446,24 @@ pub fn pending_verify() -> PendingVerify {
 
 /// Whether the bootloader rolled back to the image now running.
 ///
-/// An image that reboots while still on probation is marked
-/// `ESP_OTA_IMG_INVALID` by the bootloader, which then boots the other slot.
-/// So a device that finds the *other* slot marked invalid is a device running
-/// its predecessor because an update failed to prove itself.
+/// An image that resets while still on probation -- it never reached
+/// NervesHub to confirm itself -- is marked `ESP_OTA_IMG_ABORTED` by the
+/// bootloader, which then boots the other slot (`bootloader_utility.c`). One
+/// that gives up on itself through `esp_ota_mark_app_invalid_rollback_and_reboot`
+/// is marked `ESP_OTA_IMG_INVALID`. Either is an update that failed to prove
+/// itself, and ESP-IDF's own `esp_ota_get_last_invalid_partition` counts both.
+/// So a device that finds the *other* slot in either state is running its
+/// predecessor because an update failed.
+///
+/// Only `INVALID` used to count, with `ABORTED` taken for an interrupted
+/// download. It isn't one: a download that stops never makes its slot
+/// bootable, so the bootloader never touches it. So the common rollback, an
+/// update that couldn't reach NervesHub, went unreported.
 ///
 /// This is current state rather than an event, which is what NervesHub wants:
 /// the flag reads true for as long as the failed image is still sitting there,
 /// and clears by itself when a later update overwrites that slot. So a device
 /// stays visibly reverted until something actually fixes it.
-///
-/// Only `INVALID` counts. `ABORTED` means a download was interrupted, which is
-/// an update that never started rather than one that failed.
 #[cfg(target_os = "espidf")]
 pub fn auto_revert_detected() -> bool {
     use esp_idf_svc::sys;
@@ -472,7 +478,8 @@ pub fn auto_revert_detected() -> bool {
             return false;
         }
 
-        state == sys::esp_ota_img_states_t_ESP_OTA_IMG_INVALID
+        state == sys::esp_ota_img_states_t_ESP_OTA_IMG_ABORTED
+            || state == sys::esp_ota_img_states_t_ESP_OTA_IMG_INVALID
     }
 }
 

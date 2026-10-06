@@ -486,9 +486,11 @@ pub mod device {
             sys::esp_ota_img_states_t_ESP_OTA_IMG_NEW => "new",
             sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY => "pending verify",
             sys::esp_ota_img_states_t_ESP_OTA_IMG_VALID => "valid",
-            // The one worth spotting: the bootloader rolled back from this.
+            // The ones worth spotting: an update that failed and was rolled
+            // back from. The bootloader marks one that never confirmed itself
+            // ABORTED; INVALID is an image that gave up on itself.
+            sys::esp_ota_img_states_t_ESP_OTA_IMG_ABORTED => "ABORTED, rolled back: never confirmed",
             sys::esp_ota_img_states_t_ESP_OTA_IMG_INVALID => "INVALID, rolled back",
-            sys::esp_ota_img_states_t_ESP_OTA_IMG_ABORTED => "aborted",
             _ => "undefined",
         }
     }
