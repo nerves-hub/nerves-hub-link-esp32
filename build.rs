@@ -7,6 +7,7 @@ fn main() {
     // where the option is off, or on the host where there is no sdkconfig.
     println!("cargo::rustc-check-cfg=cfg(esp_idf_esp_tls_client_session_tickets)");
     println!("cargo::rustc-check-cfg=cfg(esp_idf_mbedtls_ssl_proto_tls1_3)");
+    println!("cargo::rustc-check-cfg=cfg(esp_idf_mbedtls_have_time)");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("espidf") {
         embuild::espidf::sysenv::output();

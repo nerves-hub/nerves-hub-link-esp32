@@ -485,7 +485,14 @@ impl LoadedSession {
         let ret = unsafe {
             sys::mbedtls_ssl_session_load(&mut loaded.0.saved_session, bytes.as_ptr(), bytes.len())
         };
-        (ret == 0).then_some(loaded)
+        if ret != 0 {
+            return None;
+        }
+
+        #[cfg(all(esp_idf_mbedtls_ssl_proto_tls1_3, esp_idf_mbedtls_have_time))]
+        redate_ticket(&mut loaded.0.saved_session, TicketClock::Mbedtls);
+
+        Some(loaded)
     }
 
     fn as_mut_ptr(&mut self) -> *mut sys::esp_tls_client_session_t {
@@ -513,6 +520,9 @@ unsafe fn save_session(tls: *mut sys::esp_tls_t) -> Option<Vec<u8>> {
         return None;
     }
 
+    #[cfg(all(esp_idf_mbedtls_ssl_proto_tls1_3, esp_idf_mbedtls_have_time))]
+    redate_ticket(&mut (*session).saved_session, TicketClock::Wall);
+
     let mut len = 0usize;
     sys::mbedtls_ssl_session_save(&(*session).saved_session, ptr::null_mut(), 0, &mut len);
 
@@ -529,6 +539,47 @@ unsafe fn save_session(tls: *mut sys::esp_tls_t) -> Option<Vec<u8>> {
         bytes.truncate(len);
         bytes
     })
+}
+
+/// Which clock a TLS 1.3 ticket's date is on: mbedTLS's, which restarts at
+/// every boot, while the session is in use; the wall clock's, which goes on
+/// through deep sleep, while it is saved. See `TlsSession`'s module docs.
+#[cfg(all(
+    esp_idf_esp_tls_client_session_tickets,
+    esp_idf_mbedtls_ssl_proto_tls1_3,
+    esp_idf_mbedtls_have_time
+))]
+#[derive(Clone, Copy)]
+enum TicketClock {
+    Mbedtls,
+    Wall,
+}
+
+/// Move a TLS 1.3 session's ticket date onto `to`, keeping its age. Anything
+/// else -- a TLS 1.2 session, one with no ticket -- is left as it is.
+#[cfg(all(
+    esp_idf_esp_tls_client_session_tickets,
+    esp_idf_mbedtls_ssl_proto_tls1_3,
+    esp_idf_mbedtls_have_time
+))]
+fn redate_ticket(session: &mut sys::mbedtls_ssl_session, to: TicketClock) {
+    if session.private_tls_version != sys::mbedtls_ssl_protocol_version_MBEDTLS_SSL_VERSION_TLS1_3
+        || session.private_ticket.is_null()
+    {
+        return;
+    }
+
+    let mbedtls_now = unsafe { sys::mbedtls_ms_time() };
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64);
+    let (from_now, to_now) = match to {
+        TicketClock::Wall => (mbedtls_now, wall_now),
+        TicketClock::Mbedtls => (wall_now, mbedtls_now),
+    };
+
+    session.private_ticket_reception_time =
+        crate::tls_session::rebase(session.private_ticket_reception_time, from_now, to_now);
 }
 
 /// The protocol the handshake settled on, as mbedTLS names it.
