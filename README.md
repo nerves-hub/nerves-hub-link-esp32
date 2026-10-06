@@ -510,6 +510,11 @@ This crate confirms only **after** rejoining NervesHub. Confirming at startup
 would cancel the rollback for an image that cannot reach the server, the exact
 failure rollback exists to catch.
 
+The bootloader marks an image that reset before confirming itself `ABORTED`
+and boots its predecessor. That predecessor then says so in its join
+(`firmware_auto_revert_detected`) and logs a warning, for as long as the
+failed image is still in the other slot.
+
 ## Delta updates
 
 NervesHub sends a patch rather than a whole image where it has one. On the
@@ -581,7 +586,7 @@ fixed set of commands on the far end instead.
 ```
 esp32> partitions
 running   ota_0    at 0x020000   1966080 bytes  valid
-next      ota_1    at 0x200000   1966080 bytes  INVALID, rolled back
+next      ota_1    at 0x200000   1966080 bytes  ABORTED, rolled back: never confirmed
 
 esp32> heap
 total        338384
