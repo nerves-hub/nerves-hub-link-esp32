@@ -2,8 +2,8 @@
 //!
 //! The device already writes a log; the only thing missing is that nobody who
 //! is not holding a USB cable can read it. This captures what the `log` crate
-//! is given, keeps a bounded amount of it, and hands it to the agent to send
-//! over the logging extension.
+//! is given, keeps a bounded amount of it (by lines and by bytes), and hands it
+//! to the agent to send over the logging extension.
 //!
 //! ```ignore
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,9 +43,12 @@
 //!
 //! NervesHub rate limits log traffic per device, so the connection drains this
 //! queue slowly by design. A device that logs faster than that fills the queue,
-//! and something has to give. New lines are dropped rather than old ones,
-//! because the first line of a failure explains it and the hundredth repeats
-//! it, and the count of what was lost is reported once the backlog clears.
+//! and something has to give. So does one that logs a lot before it connects:
+//! the queue is capped in bytes as well as lines, because the first TLS
+//! handshake, the most memory the connection ever needs, comes while it is
+//! full. New lines are dropped rather than old ones, because the first line of
+//! a failure explains it and the hundredth repeats it, and the count of what
+//! was lost is reported once the backlog clears.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,9 +60,19 @@ use crate::extensions::LogLine;
 
 /// How many lines are held while waiting for the connection.
 ///
-/// At roughly a hundred bytes a line this is a few kilobytes, which is a real
-/// amount of an ESP32's heap but small next to what a websocket already costs.
+/// A line holds more heap than its text: the line itself, and each of its
+/// strings as an allocation of its own. Measured on an ESP32-C6, a backlog of
+/// 64 ordinary lines held about 16 KB, which is why the bytes are capped as
+/// well (see [`DEFAULT_MAX_BYTES`]).
 pub const DEFAULT_CAPACITY: usize = 64;
+
+/// How much heap the held lines may take, by default.
+///
+/// A device that waits a while before connecting reaches its first handshake
+/// with a full backlog, and a TLS handshake is the most memory the connection
+/// ever needs at once. Lines past this are dropped and counted, as lines past
+/// the count are.
+pub const DEFAULT_MAX_BYTES: usize = 8 * 1024;
 
 /// The level names NervesHub stores.
 ///
@@ -99,8 +112,9 @@ pub fn unix_micros() -> Option<u64> {
 /// it is behind a lock and none of it allocates while holding one longer than
 /// a push.
 pub struct LogBuffer {
-    lines: Mutex<VecDeque<LogLine>>,
+    backlog: Mutex<Backlog>,
     capacity: usize,
+    max_bytes: usize,
     dropped: AtomicUsize,
     /// The lowest level forwarded to NervesHub, as `log::Level as usize`.
     ///
@@ -110,18 +124,43 @@ pub struct LogBuffer {
     threshold: AtomicUsize,
 }
 
+/// The held lines, and the heap they hold, under one lock.
+struct Backlog {
+    lines: VecDeque<LogLine>,
+    bytes: usize,
+}
+
+impl Backlog {
+    fn pop_front(&mut self) -> Option<LogLine> {
+        let line = self.lines.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(heap_cost(&line));
+        Some(line)
+    }
+}
+
 impl LogBuffer {
+    /// Up to `capacity` lines, and [`DEFAULT_MAX_BYTES`] of them.
     pub fn new(capacity: usize) -> Self {
         Self::with_threshold(capacity, log::Level::Info)
     }
 
     pub fn with_threshold(capacity: usize, threshold: log::Level) -> Self {
         Self {
-            lines: Mutex::new(VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY))),
+            backlog: Mutex::new(Backlog {
+                lines: VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY)),
+                bytes: 0,
+            }),
             capacity,
+            max_bytes: DEFAULT_MAX_BYTES,
             dropped: AtomicUsize::new(0),
             threshold: AtomicUsize::new(threshold as usize),
         }
+    }
+
+    /// Hold at most this much heap in lines, rather than [`DEFAULT_MAX_BYTES`].
+    pub fn max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
     }
 
     /// The lowest level currently forwarded to NervesHub.
@@ -150,17 +189,19 @@ impl LogBuffer {
     /// logger that can panic or deadlock is worse than one that loses a line.
     /// A poisoned lock is treated as a full queue for the same reason.
     pub fn push(&self, line: LogLine) {
-        let Ok(mut lines) = self.lines.lock() else {
+        let Ok(mut backlog) = self.backlog.lock() else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        if lines.len() >= self.capacity {
+        let cost = heap_cost(&line);
+        if backlog.lines.len() >= self.capacity || backlog.bytes + cost > self.max_bytes {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
-        lines.push_back(line);
+        backlog.bytes += cost;
+        backlog.lines.push_back(line);
     }
 
     /// The next line to send, stamped if it was logged before the clock was.
@@ -187,10 +228,10 @@ impl LogBuffer {
         let mut bytes = 0;
 
         {
-            let Ok(mut lines) = self.lines.lock() else { return batch };
+            let Ok(mut backlog) = self.backlog.lock() else { return batch };
 
             while batch.len() < max_lines {
-                let Some(next) = lines.front() else { break };
+                let Some(next) = backlog.lines.front() else { break };
 
                 let size = approximate_json_len(next);
                 if !batch.is_empty() && bytes + size > max_bytes {
@@ -198,7 +239,7 @@ impl LogBuffer {
                 }
 
                 bytes += size;
-                if let Some(line) = lines.pop_front() {
+                if let Some(line) = backlog.pop_front() {
                     batch.push(stamp(line, now_micros.map(|t| t + batch.len() as u64)));
                 }
             }
@@ -219,9 +260,9 @@ impl LogBuffer {
     /// Reporting it earlier would spend the device's rate limit describing the
     /// loss instead of sending what survived.
     pub fn pop(&self) -> Option<LogLine> {
-        let mut lines = self.lines.lock().ok()?;
+        let mut backlog = self.backlog.lock().ok()?;
 
-        if let Some(line) = lines.pop_front() {
+        if let Some(line) = backlog.pop_front() {
             return Some(line);
         }
 
@@ -229,13 +270,18 @@ impl LogBuffer {
             0 => None,
             n => Some(LogLine::new(
                 "warning",
-                format!("{n} log lines were dropped: the device logged faster than NervesHub accepts"),
+                format!("{n} log lines were dropped: the device logged more than it keeps waiting to send"),
             )),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.lines.lock().map(|lines| lines.len()).unwrap_or(0)
+        self.backlog.lock().map(|backlog| backlog.lines.len()).unwrap_or(0)
+    }
+
+    /// The heap the held lines take, as [`max_bytes`](Self::max_bytes) counts it.
+    pub fn bytes(&self) -> usize {
+        self.backlog.lock().map(|backlog| backlog.bytes).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -255,10 +301,21 @@ fn stamp(line: LogLine, now_micros: Option<u64>) -> LogLine {
     }
 }
 
+/// The heap a held line takes: the line itself, as the queue stores it, and
+/// the buffer behind each of its strings. The allocator's own few bytes per
+/// allocation are left out.
+fn heap_cost(line: &LogLine) -> usize {
+    let strings = line.level.capacity()
+        + line.message.capacity()
+        + line.timestamp.as_ref().map_or(0, String::capacity)
+        + line.meta.iter().map(|(key, value)| key.capacity() + value.capacity()).sum::<usize>();
+    core::mem::size_of::<LogLine>() + line.meta.capacity() * core::mem::size_of::<(String, String)>() + strings
+}
+
 /// About what a line costs as JSON in a batch: its strings, plus the keys,
 /// quotes and punctuation around them. Escaping can make it more, which is why
 /// the budget it is checked against leaves room.
-fn approximate_json_len(line: &LogLine) -> usize {
+pub(crate) fn approximate_json_len(line: &LogLine) -> usize {
     let meta: usize = line.meta.iter().map(|(key, value)| key.len() + value.len() + 6).sum();
     let timestamp = line.timestamp.as_ref().map_or(0, |t| t.len() + 16);
     line.level.len() + line.message.len() + timestamp + meta + 40
@@ -506,6 +563,45 @@ mod tests {
             sent.payload()["meta"]["time"],
             serde_json::json!("1700000000000000")
         );
+    }
+
+    // A device that connects late reaches its first TLS handshake with a full
+    // backlog, so the heap the lines hold is capped as well as their count.
+    #[test]
+    fn lines_past_the_byte_cap_are_dropped_and_counted() {
+        let cost = heap_cost(&line("x"));
+        let buffer = LogBuffer::new(64).max_bytes(cost * 2);
+
+        for _ in 0..3 {
+            buffer.push(line("x"));
+        }
+
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.bytes(), cost * 2);
+        assert_eq!(buffer.dropped(), 1);
+    }
+
+    #[test]
+    fn a_line_sent_gives_its_bytes_back() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(line("one"));
+        buffer.push(line("two"));
+
+        let _ = buffer.take_stamped(1, 10_000, Some(1_790_000_000_000_000));
+        assert_eq!(buffer.bytes(), heap_cost(&line("two")));
+
+        let _ = buffer.pop();
+        assert_eq!(buffer.bytes(), 0);
+    }
+
+    // What a line holds is more than its text: the line, and every string.
+    #[test]
+    fn a_lines_cost_counts_all_of_its_strings() {
+        let bare = heap_cost(&line("message"));
+        let with_meta = heap_cost(&line("message").meta("target", "app"));
+
+        assert!(bare > "info".len() + "message".len());
+        assert!(with_meta >= bare + "target".len() + "app".len());
     }
 
     #[test]
