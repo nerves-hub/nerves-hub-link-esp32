@@ -43,6 +43,7 @@
 //! each message carries its own TLS record, TCP segment and Phoenix envelope,
 //! so a batch is both what the limit allows and what the link can afford.
 
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{json, Map, Value};
 
 use crate::message::{Message, RefGenerator};
@@ -195,19 +196,96 @@ impl LogLine {
         self.meta.iter().any(|(key, _)| key == "time")
     }
 
+    /// The line as a [`Value`], which is what its [`Serialize`] writes.
     pub fn payload(&self) -> Value {
-        let mut map = Map::new();
-        map.insert("level".into(), json!(self.level));
-        map.insert("message".into(), json!(self.message));
-        if let Some(timestamp) = &self.timestamp {
-            map.insert("timestamp".into(), json!(timestamp));
-        }
+        // Nothing in a line can fail to become JSON: every key is a string.
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// `{"level", "message", "meta", "timestamp"}`, keys in that order and absent
+/// ones left out: the shape and order of the `serde_json::Map` a line used to
+/// be built as, so the text on the wire is unchanged. Written straight out, a
+/// batch of lines costs its output and nothing else. Built as `Value`s first,
+/// it cost a map, and a copy of every string, for each line: on an ESP32-C6,
+/// over 20 KB of short-lived allocations for one batch.
+impl Serialize for LogLine {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let entries = 2 + usize::from(!self.meta.is_empty()) + usize::from(self.timestamp.is_some());
+        let mut map = serializer.serialize_map(Some(entries))?;
+        map.serialize_entry("level", &self.level)?;
+        map.serialize_entry("message", &self.message)?;
         if !self.meta.is_empty() {
-            let meta: Map<String, Value> =
-                self.meta.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-            map.insert("meta".into(), Value::Object(meta));
+            map.serialize_entry("meta", &Meta(&self.meta))?;
         }
-        Value::Object(map)
+        if let Some(timestamp) = &self.timestamp {
+            map.serialize_entry("timestamp", timestamp)?;
+        }
+        map.end()
+    }
+}
+
+/// A line's `meta` as a map, as a `serde_json::Map` collected from the pairs
+/// has it: keys in order, and of a key given twice, the later value. A line
+/// carries two or three pairs, so this looks them over a few times rather than
+/// allocate to sort them.
+struct Meta<'a>(&'a [(String, String)]);
+
+impl Meta<'_> {
+    /// The smallest key after `after`, with its last value.
+    fn next_after(&self, after: Option<&str>) -> Option<(&str, &str)> {
+        let mut next: Option<(&str, &str)> = None;
+        for (key, value) in self.0 {
+            if after.is_some_and(|after| key.as_str() <= after) {
+                continue;
+            }
+            match next {
+                Some((smallest, _)) if key.as_str() > smallest => {}
+                // A key equal to the smallest so far is a later value for it.
+                _ => next = Some((key, value)),
+            }
+        }
+        next
+    }
+}
+
+impl Serialize for Meta<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let distinct = self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(i, (key, _))| !self.0[..*i].iter().any(|(earlier, _)| earlier == key))
+            .count();
+        let mut map = serializer.serialize_map(Some(distinct))?;
+        let mut after = None;
+        while let Some((key, value)) = self.next_after(after) {
+            map.serialize_entry(key, value)?;
+            after = Some(key);
+        }
+        map.end()
+    }
+}
+
+/// Log lines as one message under logging 0.1.0: `{"lines": [...]}`, written
+/// straight from the lines. See [`Extensions::log_batch`].
+#[derive(Clone, Copy, Debug)]
+pub struct LogBatch<'a> {
+    lines: &'a [LogLine],
+}
+
+impl LogBatch<'_> {
+    /// Roughly how long it is as JSON, to size the buffer it is written into.
+    pub fn len_estimate(&self) -> usize {
+        self.lines.iter().map(crate::logging::approximate_json_len).sum::<usize>() + 16
+    }
+}
+
+impl Serialize for LogBatch<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("lines", self.lines)?;
+        map.end()
     }
 }
 
@@ -445,8 +523,16 @@ impl Extensions {
             return lines.iter().flat_map(|line| self.log(line)).collect();
         }
 
-        let lines: Vec<Value> = lines.iter().map(LogLine::payload).collect();
-        vec![Outgoing::Send { event: "logging:send".into(), payload: json!({ "lines": lines }) }]
+        let batch = serde_json::to_value(LogBatch { lines }).unwrap_or(Value::Null);
+        vec![Outgoing::Send { event: "logging:send".into(), payload: batch }]
+    }
+
+    /// Log lines as one batch, if logging is attached at a version that takes
+    /// batches and there is anything to send: what [`logs`](Self::logs) sends
+    /// at 0.1.0, but for writing straight into a frame rather than as a
+    /// `Value`. The link sends batches this way.
+    pub fn log_batch<'a>(&self, lines: &'a [LogLine]) -> Option<LogBatch<'a>> {
+        (!lines.is_empty() && self.logging_batched()).then_some(LogBatch { lines })
     }
 }
 
@@ -717,5 +803,51 @@ mod tests {
 
         assert!(!extensions.invited());
         assert_eq!(extensions.join_params(), json!({"logging": "0.0.1"}));
+    }
+
+    // A line is written straight out, and has to read as the `serde_json::Map`
+    // it used to be built as: keys in order, absent ones left out.
+    #[test]
+    fn a_line_is_written_as_its_map_was() {
+        let line = LogLine::new("info", "one").at("2026-10-20T00:00:00Z").meta("target", "app");
+
+        assert_eq!(
+            serde_json::to_string(&line).unwrap(),
+            r#"{"level":"info","message":"one","meta":{"target":"app"},"timestamp":"2026-10-20T00:00:00Z"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLine::new("debug", "bare")).unwrap(),
+            r#"{"level":"debug","message":"bare"}"#
+        );
+    }
+
+    // Collected into a map, a repeated key kept its last value; msgpack, which
+    // writes a map's length first, needs the count of distinct keys.
+    #[test]
+    fn a_repeated_meta_key_keeps_its_last_value() {
+        let line = LogLine::new("info", "m").meta("time", "1").meta("target", "app").meta("time", "2");
+        let expected = json!({"level": "info", "message": "m", "meta": {"target": "app", "time": "2"}});
+
+        assert_eq!(
+            serde_json::to_string(&line).unwrap(),
+            r#"{"level":"info","message":"m","meta":{"target":"app","time":"2"}}"#
+        );
+        let msgpack = rmp_serde::to_vec(&line).unwrap();
+        assert_eq!(rmp_serde::from_slice::<Value>(&msgpack).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_batch_is_offered_only_where_logging_batches() {
+        let lines = [LogLine::new("info", "one")];
+
+        let mut batched = advertising(Enabled::none().logging(), json!({"logging": ["0.1.0"]}));
+        let _ = batched.on_join_reply(&json!(["logging"]));
+        assert!(batched.log_batch(&lines).is_some());
+        assert!(batched.log_batch(&[]).is_none());
+
+        let mut single = Extensions::new(Enabled::none().logging());
+        single.on_invitation(&json!({}));
+        let _ = single.on_join_reply(&json!(["logging"]));
+        assert!(single.log_batch(&lines).is_none());
     }
 }

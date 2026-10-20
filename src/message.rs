@@ -25,6 +25,7 @@
 //! qualified topic is wrong — it would be rewritten to `device:<device_id>:...`
 //! and fail to route.
 
+use serde::Serialize;
 use serde_json::Value;
 
 /// The topic a device joins. See the module docs — this is deliberately
@@ -215,10 +216,15 @@ impl Message {
 
     /// This message as `serializer` writes it.
     pub fn encode_as(&self, serializer: Serializer) -> Result<Frame, crate::error::Error> {
-        Ok(match serializer {
-            Serializer::Json => Frame::Text(self.encode()?),
-            Serializer::MsgPack => Frame::Binary(self.encode_msgpack()?),
-        })
+        encode_frame(
+            serializer,
+            self.join_ref.as_deref(),
+            self.reference.as_deref(),
+            &self.topic,
+            &self.event,
+            &self.payload,
+            0,
+        )
     }
 
     /// Read a frame, by what kind it is: text is JSON, binary is msgpack.
@@ -269,6 +275,38 @@ impl Message {
     pub fn reply_response(&self) -> Option<&Value> {
         self.payload.get("response")
     }
+}
+
+/// A message as `serializer` writes it, whatever its payload is: a [`Value`],
+/// or something that serializes itself without first being made into one, as
+/// a batch of log lines does. `capacity` is the size to start the buffer at,
+/// so that one whose size is known roughly is not grown and copied on the way;
+/// 0 leaves it to grow.
+pub fn encode_frame<P: Serialize + ?Sized>(
+    serializer: Serializer,
+    join_ref: Option<&str>,
+    reference: Option<&str>,
+    topic: &str,
+    event: &str,
+    payload: &P,
+    capacity: usize,
+) -> Result<Frame, crate::error::Error> {
+    // A tuple, so an array, in both serializers. (rmp_serde would write a Rust
+    // struct as an array of its fields, which is why nothing here is one.)
+    let message = (join_ref, reference, topic, event, payload);
+    let mut bytes = Vec::with_capacity(capacity);
+    Ok(match serializer {
+        Serializer::Json => {
+            serde_json::to_writer(&mut bytes, &message)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| crate::error::Error::Protocol("JSON that is not UTF-8".into()))?;
+            Frame::Text(text)
+        }
+        Serializer::MsgPack => {
+            rmp_serde::encode::write(&mut bytes, &message)?;
+            Frame::Binary(bytes)
+        }
+    })
 }
 
 fn reference_text(reference: Value) -> Option<String> {

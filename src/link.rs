@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
 use crate::message::{CONSOLE_TOPIC, CONSOLE_VERSION};
-use crate::message::{event, Frame, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
+use crate::message::{encode_frame, event, Frame, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::metadata::{BootReport, FirmwareMetadata};
 use crate::update::{Stage, UpdateDecision, UpdatePayload};
 
@@ -466,11 +466,29 @@ impl Link {
 
     /// Send log lines, batched if the attached version batches, if the
     /// logging extension is attached.
+    ///
+    /// A batch is written from the lines into a frame of about the size it
+    /// needs, never built as a `Value`: on a device, building it was most of
+    /// what sending the log cost (see [`LogBatch`](crate::extensions::LogBatch)).
     pub fn send_logs<T: Transport>(
         &mut self,
         transport: &mut T,
         lines: &[LogLine],
     ) -> Result<(), Error> {
+        if let Some(batch) = self.extensions.log_batch(lines) {
+            let reference = self.refs.next_ref();
+            let frame = encode_frame(
+                self.config.serializer,
+                self.extensions_join_ref.as_deref(),
+                Some(&reference),
+                EXTENSIONS_TOPIC,
+                "logging:send",
+                &batch,
+                batch.len_estimate(),
+            )?;
+            return send_frame(transport, frame);
+        }
+
         let outgoing = self.extensions.logs(lines);
         self.send_extension(transport, outgoing)
     }
@@ -580,10 +598,14 @@ impl Link {
     /// Every frame goes out through here, in the serializer the socket URL
     /// asked for: the server reads nothing else on that socket.
     fn write<T: Transport>(&self, transport: &mut T, message: &Message) -> Result<(), Error> {
-        match message.encode_as(self.config.serializer)? {
-            Frame::Text(text) => transport.send(&text),
-            Frame::Binary(bytes) => transport.send_binary(&bytes),
-        }
+        send_frame(transport, message.encode_as(self.config.serializer)?)
+    }
+}
+
+fn send_frame<T: Transport>(transport: &mut T, frame: Frame) -> Result<(), Error> {
+    match frame {
+        Frame::Text(text) => transport.send(&text),
+        Frame::Binary(bytes) => transport.send_binary(&bytes),
     }
 }
 
@@ -1065,5 +1087,65 @@ mod tests {
                 .unwrap(),
             Action::None
         );
+    }
+
+    /// Logging attached at 0.1.0, on the extensions channel joined as "7".
+    fn batched_logging(mut link: Link) -> Link {
+        use crate::extensions::Enabled;
+
+        link.extensions = Extensions::new(Enabled::none().logging());
+        link.extensions.on_invitation(&json!({"extensions": {"logging": ["0.1.0", "0.0.1"]}}));
+        let _ = link.extensions.on_join_reply(&json!(["logging"]));
+        link.extensions_join_ref = Some("7".into());
+        link
+    }
+
+    fn some_lines() -> Vec<LogLine> {
+        vec![
+            LogLine::new("info", "one").meta("target", "app").with_time(1_790_000_000_000_000),
+            LogLine::new("warning", "two, \"quoted\"").at("2026-10-20T00:00:00Z"),
+        ]
+    }
+
+    /// The batch `some_lines` makes, built the way it used to be sent.
+    fn the_old_batch(reference: Option<String>) -> Message {
+        let payload = json!({"lines": [
+            {"level": "info", "message": "one", "meta": {"target": "app", "time": "1790000000000000"}},
+            {"level": "warning", "message": "two, \"quoted\"", "timestamp": "2026-10-20T00:00:00Z"},
+        ]});
+        Message::new(EXTENSIONS_TOPIC, "logging:send", payload).with_refs(Some("7".into()), reference)
+    }
+
+    // A batch is written from the lines rather than built as a `Value`, and
+    // must come out exactly as the `Value` did, down to the order of the keys.
+    #[test]
+    fn a_log_batch_is_written_as_the_value_it_replaced() {
+        let (mut link, mut transport) = (batched_logging(link()), FakeTransport::default());
+
+        link.send_logs(&mut transport, &some_lines()).unwrap();
+
+        let reference = transport.last().reference;
+        assert!(reference.is_some());
+        assert_eq!(transport.sent.last().unwrap(), &the_old_batch(reference).encode().unwrap());
+    }
+
+    #[test]
+    fn a_msgpack_log_batch_is_written_as_the_value_it_replaced() {
+        let (mut link, mut transport) = (batched_logging(msgpack_link()), BinaryTransport::default());
+
+        link.send_logs(&mut transport, &some_lines()).unwrap();
+
+        let sent = transport.sent.last().unwrap();
+        let reference = Message::decode_msgpack(sent).unwrap().reference;
+        assert_eq!(sent, &the_old_batch(reference).encode_msgpack().unwrap());
+    }
+
+    #[test]
+    fn no_lines_send_nothing() {
+        let (mut link, mut transport) = (batched_logging(link()), FakeTransport::default());
+
+        link.send_logs(&mut transport, &[]).unwrap();
+
+        assert!(transport.sent.is_empty());
     }
 }
