@@ -435,7 +435,11 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             None => return Ok(false),
         };
 
-        link.send_console(transport, &echo)?;
+        // One message per command: the echo goes with the first answer, and
+        // each answer with the prompt after it. A message costs a Phoenix
+        // envelope, a websocket frame and a TLS record, which over a metered
+        // link is more than a short answer is.
+        let mut reply = echo;
 
         for line in lines {
             let parsed = console::parse(&line)
@@ -446,7 +450,8 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 // about to go, and whoever typed it should see that it was
                 // taken rather than watch the terminal die.
                 Some(("reboot", _)) => {
-                    link.send_console(transport, "rebooting\r\n")?;
+                    reply.push_str("rebooting\r\n");
+                    link.send_console(transport, &reply)?;
                     self.platform.sleep(Duration::from_millis(250));
                     self.platform.restart();
 
@@ -462,12 +467,16 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
             };
 
             if !output.is_empty() {
-                link.send_console(transport, &output)?;
-                link.send_console(transport, "\r\n")?;
+                reply.push_str(&output);
+                reply.push_str("\r\n");
             }
 
-            link.send_console(transport, console::PROMPT)?;
+            reply.push_str(console::PROMPT);
+            link.send_console(transport, &core::mem::take(&mut reply))?;
         }
+
+        // Typing that finished no line: the echo, and nothing else.
+        link.send_console(transport, &reply)?;
 
         Ok(false)
     }
@@ -862,8 +871,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                         console.reader = LineReader::new();
                     }
 
-                    link.send_console(transport, "\r\n")?;
-                    link.send_console(transport, console::PROMPT)?;
+                    link.send_console(transport, &format!("\r\n{}", console::PROMPT))?;
                 }
                 Ok(Action::Reconnect) => return Ok(None),
                 Ok(Action::Extension(needs)) => {
@@ -1506,6 +1514,66 @@ mod tests {
         // Echoed, and followed by a prompt: it should read as a terminal.
         assert!(output.contains("ping"), "{output:?}");
         assert!(output.contains(console::PROMPT), "{output:?}");
+    }
+
+    /// The `data` of each message the device wrote to the terminal.
+    fn console_messages(shared: &Rc<RefCell<Shared>>) -> Vec<String> {
+        shared
+            .borrow()
+            .sent
+            .iter()
+            .filter_map(|frame| {
+                let message = Message::decode(frame).ok()?;
+                (message.topic == "console" && message.event == "up")
+                    .then(|| message.payload["data"].as_str().map(str::to_string))?
+            })
+            .collect()
+    }
+
+    // A short answer costs less than the envelope it travels in, so the echo,
+    // the answer and the prompt go together rather than one message each.
+    #[test]
+    fn a_command_is_answered_in_one_message() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("ping\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console().command("ping", "say pong", |_args, out| {
+            write!(out, "pong")?;
+            Ok(())
+        });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        assert_eq!(console_messages(&shared), [format!("ping\r\npong\r\n{}", console::PROMPT)]);
+    }
+
+    // Several commands at once, from the REST API, get a message each, so
+    // that a long paste doesn't make one message out of all of their output.
+    #[test]
+    fn each_command_typed_at_once_is_answered_in_its_own_message() {
+        let plat = platform(vec![vec![
+            join_reply(json!({"update_available": false})),
+            typed("ping\rping\r"),
+        ]]);
+        let shared = Rc::clone(&plat.shared);
+
+        let mut agent = agent(plat).with_console().command("ping", "say pong", |_args, out| {
+            write!(out, "pong")?;
+            Ok(())
+        });
+
+        let mut transport = agent.platform.connect(&config()).unwrap();
+        let _ = agent.session(&mut transport, &mut false);
+
+        let prompt = console::PROMPT;
+        assert_eq!(
+            console_messages(&shared),
+            [format!("ping\r\nping\r\npong\r\n{prompt}"), format!("pong\r\n{prompt}")]
+        );
     }
 
     #[test]
