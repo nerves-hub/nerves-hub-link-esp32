@@ -2,20 +2,28 @@
 #
 # Write a device identity into the `certs` NVS partition and flash it.
 #
-# The identity half is `nh`'s job — NervesHub pins the certificate's
-# fingerprint, so a self-signed per-device certificate is enough and there is no
-# CA to manage. This script only does the ESP-specific part: turn the key and
-# certificate into an NVS image and put it on the device.
+# The identity half is `nh`'s job — it signs a per-device certificate with your
+# organization's CA, made once with `nh ca generate --upload`. NervesHub checks
+# a certificate it has not seen against the organization's CAs (a self-signed
+# one is refused), and with Just In Time Provisioning on the CA it creates the
+# device on its first connection, so nothing is uploaded here. This script only
+# does the ESP-specific part: turn the key and certificate into an NVS image and
+# put it on the device.
 #
-#   ./scripts/provision.sh my-device-001 /dev/tty.usbmodem1101
+#   ./scripts/provision.sh my-device-001 2026-10-21-09-15-02 /dev/tty.usbmodem1101
+#
+# The second argument names the CA: the time its files in <data-dir>/ca/<org>/
+# are named by, as in the paths `nh ca generate` prints.
 #
 # Requires `nh` and an ESP-IDF environment on PATH (nvs_partition_gen.py,
 # esptool.py). Run ESP-IDF's export.sh first if they are not.
 
 set -euo pipefail
 
-IDENTIFIER="${1:?usage: provision.sh <device-identifier> [serial-port]}"
-PORT="${2:-}"
+USAGE="usage: provision.sh <device-identifier> <ca-name> [serial-port]"
+IDENTIFIER="${1:?${USAGE}}"
+CA_NAME="${2:?${USAGE}}"
+PORT="${3:-}"
 
 # Must match the `certs` partition in partitions.csv.
 CERTS_OFFSET="0x3E0000"
@@ -29,13 +37,14 @@ KEY_KEY="device.key"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-echo "==> Generating and registering a certificate for ${IDENTIFIER}"
-nh device certificates generate "${IDENTIFIER}" --self-signed --upload
+echo "==> Generating a certificate for ${IDENTIFIER}, signed by CA ${CA_NAME}"
+nh device certificates generate "${IDENTIFIER}" --ca "${CA_NAME}"
+echo "    There is nothing to upload: NervesHub registers the certificate on the device's first connection."
 
 # `nh` writes to <data-dir>/certificates/<org>/. `data-dir` is a global flag
 # rather than a persisted setting, so it is not readable via `nh config get` —
-# fall back to its default.
-data_dir="${NERVES_HUB_DATA_DIR:-$HOME/.nerves-hub}"
+# fall back to its default, read from the same environment variables `nh` reads.
+data_dir="${NERVES_HUB_DATA_DIR:-${NERVES_CLOUD_DATA_DIR:-$HOME/.nh}}"
 certs_dir="${data_dir}/certificates"
 
 if [[ ! -d "${certs_dir}" ]]; then

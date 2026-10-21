@@ -27,8 +27,8 @@ bootloader's rollback protection intact.
 | Extensions: health, geo, logging | ✅ |
 | Reboot and identify | ✅ |
 | Console: a fixed set of commands | ✅ |
-| mTLS transport | Compiles, never run; the bench uses shared secrets |
-| Device identity from NVS | Compiles, never run |
+| mTLS transport | Run on hardware: a CA-signed client certificate over `wss://` to NervesCloud on an ESP32-C6, TLS 1.2, session resumption included |
+| Device identity from NVS | Run on hardware: the certificate and key read from the `certs` partition on an ESP32-C6 |
 
 ## Requirements
 
@@ -406,18 +406,42 @@ For **shared secrets**, nothing is provisioned: the identifier and secret are
 configuration, and a product-wide secret registers unknown devices on first
 connection. That is the quickest way to a working bench.
 
-For **mTLS**, a device certificate in NVS. NervesHub identifies a device by its client
-certificate. It pins the SHA-1 fingerprint of the DER, so the certificate does
-**not** need a CA. A self-signed, per-device certificate is enough. [`nh`](https://github.com/nerves-hub/nh) 
-does the whole identity half in one command:
+For **mTLS**, a device certificate in NVS, signed by a CA registered to your
+organization. NervesHub identifies a device by its client certificate: the
+first time it sees one, it checks the signer against the organization's CAs,
+and from then on it knows the certificate by the SHA-1 fingerprint of its DER.
+Don't use `nh`'s `--self-signed` for this: NervesHub refuses a self-signed
+device certificate in the TLS handshake, even one uploaded for the device.
+
+[`nh`](https://github.com/nerves-hub/nh) does the identity half. Once per
+organization, make a CA and register it:
 
 ```bash
-nh device certificates generate my-device-001 --self-signed --upload
+nh ca generate --upload
 ```
 
-That generates a secp256r1 key, produces a self-signed client certificate with
-the device identifier as the common name, and registers it with NervesHub.
-Files land in `~/.nh/certificates/<org>/`.
+That writes the CA's key and certificate to `~/.nh/ca/<org>/`, named by the
+time it was made (`2026-10-21-09-15-02-cert.pem`, say), and proves to NervesHub
+that you hold the key. Whoever holds that key can add devices to your
+organization, so keep it on the machine that provisions them. Then open the CA
+on the organization's Certificate Authorities page, turn on **Just In Time
+Provisioning**, and choose the product new devices join, with a description and
+tags to copy to each of them (the page requires both for now). `nh` has no flag
+for that.
+
+Then, for each device:
+
+```bash
+nh device certificates generate my-device-001 --ca 2026-10-21-09-15-02
+```
+
+`--ca` takes the time the CA's files are named by. That generates a secp256r1
+key and a client certificate signed by the CA, with the device identifier as
+the common name. Files land in `~/.nh/certificates/<org>/`. Nothing is
+uploaded: on the device's first connection, NervesHub checks the certificate
+against the CA, creates the device in the JITP product and pins the
+certificate. Without JITP the device has to exist in NervesHub first; its
+first connection then registers the certificate.
 
 Then write them into the `certs` partition and flash. `scripts/provision.sh`
 does this, or by hand:
