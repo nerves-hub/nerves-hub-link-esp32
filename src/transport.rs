@@ -53,7 +53,7 @@ use esp_idf_svc::sys;
 
 use crate::config::{Config, Credentials};
 use crate::error::Error;
-use crate::inbound::{Inbound, Incoming, Piece};
+use crate::inbound::{Inbound, Incoming, Piece, MAX_UNREAD_BYTES};
 use crate::link::Transport;
 use crate::message::Frame;
 use crate::tls;
@@ -193,11 +193,11 @@ impl WebSocketTransport {
             ping_interval_sec: WEBSOCKET_PING_INTERVAL_SECS,
             disable_pingpong_discon: true,
 
-            // Frames bigger than the buffer arrive in pieces, which `Events`
-            // puts back together, so this is about how many pieces rather than
-            // whether a message survives. Every message NervesHub sends a
-            // device -- the largest, an `update` with a signed firmware URL, is
-            // a little over 1 KiB -- fits in one.
+            // Frames bigger than the buffer arrive in pieces, which `Inbound`
+            // puts back together up to `MAX_UNREAD_BYTES`, so this is about how
+            // many pieces rather than whether a message survives. Every
+            // message NervesHub sends a device -- the largest, an `update` with
+            // a signed firmware URL, is a little over 1 KiB -- fits in one.
             //
             // There are two of these, one each way. With
             // CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER, which
@@ -483,7 +483,18 @@ impl Transport for WebSocketTransport {
 
     fn recv_frame(&mut self) -> Result<Option<Frame>, Error> {
         match self.incoming.recv_timeout(self.recv_timeout) {
-            Ok(Incoming::Frame(frame)) => Ok(Some(frame)),
+            Ok(Incoming::Frame(frame)) => {
+                self.events().inbound.read(&frame);
+                Ok(Some(frame))
+            }
+
+            Ok(Incoming::Overflow) => {
+                log::warn!(
+                    "more than {MAX_UNREAD_BYTES} bytes arrived from NervesHub without being read; \
+                     dropping the connection"
+                );
+                Err(Error::Transport("too much arrived unread".into()))
+            }
 
             // Not whether the client is connected now, which it may be again,
             // by itself, to a socket the session has never joined.

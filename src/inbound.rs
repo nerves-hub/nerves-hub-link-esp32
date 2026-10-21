@@ -12,6 +12,17 @@
 
 use crate::message::Frame;
 
+/// The most the transport holds that the run loop hasn't read: whole messages
+/// waiting for it, and the one being put together.
+///
+/// The largest message NervesHub sends a device, an `update` with a signed
+/// firmware URL, is a little over 1 KiB, and of what a device sends it answers
+/// only heartbeats, so little waits even while a download keeps the run loop
+/// from reading. Past this something is wrong at the other end, and it is the
+/// connection that gives rather than the heap: a message is decoded whole,
+/// into a `Value` several times its size.
+pub(crate) const MAX_UNREAD_BYTES: usize = 16 * 1024;
+
 /// What the transport hands to the run loop.
 ///
 /// A close has to travel the same channel as the frames, in order with them:
@@ -23,6 +34,9 @@ pub(crate) enum Incoming {
     /// The client's `n`th report of a closed socket, counting from 1. See
     /// [`Inbound::ends_session`].
     Closed(u32),
+    /// More arrived than the run loop had read, past [`MAX_UNREAD_BYTES`].
+    /// Nothing after it is kept, and the session ends once it is read.
+    Overflow,
 }
 
 pub(crate) const OPCODE_CONTINUATION: u8 = 0x0;
@@ -51,6 +65,10 @@ pub(crate) struct Inbound {
     /// Whether `partial` is binary. A continuation carries no kind of its
     /// own; it is whatever the frame that started the message was.
     binary: bool,
+    /// Bytes of whole messages handed on that the run loop hasn't read yet.
+    unread: usize,
+    /// Past [`MAX_UNREAD_BYTES`]: everything from here on is dropped.
+    overflowed: bool,
     /// Closes reported so far.
     closes: u32,
     /// How many of them came before the client first connected.
@@ -86,6 +104,12 @@ impl Inbound {
         self.closes_before_connecting.is_some_and(|before| n > before)
     }
 
+    /// The run loop has read `frame`, so it no longer counts against
+    /// [`MAX_UNREAD_BYTES`].
+    pub(crate) fn read(&mut self, frame: &Frame) {
+        self.unread = self.unread.saturating_sub(frame.len());
+    }
+
     /// Take in one piece, and say what the run loop should hear of it, if
     /// anything.
     ///
@@ -95,11 +119,21 @@ impl Inbound {
     pub(crate) fn piece(&mut self, piece: Piece<'_>) -> Option<Incoming> {
         match piece.opcode {
             OPCODE_TEXT | OPCODE_BINARY | OPCODE_CONTINUATION => {
+                if self.overflowed {
+                    return None;
+                }
+
                 // A text or binary frame's first piece starts a message;
                 // anything else carries one on.
                 if piece.opcode != OPCODE_CONTINUATION && piece.offset == 0 {
                     self.partial.clear();
                     self.binary = piece.opcode == OPCODE_BINARY;
+                }
+
+                if self.unread + self.partial.len() + piece.bytes.len() > MAX_UNREAD_BYTES {
+                    self.overflowed = true;
+                    self.partial = Vec::new();
+                    return Some(Incoming::Overflow);
                 }
                 self.partial.extend_from_slice(piece.bytes);
 
@@ -109,17 +143,20 @@ impl Inbound {
                 }
 
                 let message = core::mem::take(&mut self.partial);
-                if self.binary {
-                    return Some(Incoming::Frame(Frame::Binary(message)));
-                }
-
-                match String::from_utf8(message) {
-                    Ok(text) => Some(Incoming::Frame(Frame::Text(text))),
-                    Err(_) => {
-                        log::warn!("dropped a text frame that was not UTF-8");
-                        None
+                let frame = if self.binary {
+                    Frame::Binary(message)
+                } else {
+                    match String::from_utf8(message) {
+                        Ok(text) => Frame::Text(text),
+                        Err(_) => {
+                            log::warn!("dropped a text frame that was not UTF-8");
+                            return None;
+                        }
                     }
-                }
+                };
+
+                self.unread += frame.len();
+                Some(Incoming::Frame(frame))
             }
             OPCODE_CLOSE => Some(self.closed()),
             _ => None,
@@ -255,5 +292,72 @@ mod tests {
         let mut inbound = Inbound::default();
 
         assert_eq!(inbound.piece(frame(PING, true, b"")), None);
+    }
+
+    fn text_of(len: usize) -> Vec<u8> {
+        vec![b'a'; len]
+    }
+
+    fn is_frame(incoming: Option<Incoming>) -> bool {
+        matches!(incoming, Some(Incoming::Frame(_)))
+    }
+
+    #[test]
+    fn a_message_as_long_as_the_limit_fits() {
+        let mut inbound = Inbound::default();
+
+        assert!(is_frame(inbound.piece(frame(OPCODE_TEXT, true, &text_of(MAX_UNREAD_BYTES)))));
+    }
+
+    // A frame announcing more than the device will hold is given up partway,
+    // and what had been gathered of it is let go.
+    #[test]
+    fn a_message_past_the_limit_overflows_and_lets_go() {
+        let mut inbound = Inbound::default();
+        let half = text_of(MAX_UNREAD_BYTES / 2 + 1);
+        let whole = 2 * half.len();
+
+        assert_eq!(inbound.piece(piece_of(OPCODE_TEXT, 0, whole, &half)), None);
+        assert_eq!(
+            inbound.piece(piece_of(OPCODE_TEXT, half.len(), whole, &half)),
+            Some(Incoming::Overflow)
+        );
+        assert_eq!(inbound.partial.capacity(), 0);
+    }
+
+    // The run loop is told once. After that nothing is kept but closes, which
+    // still have to reach it.
+    #[test]
+    fn nothing_after_an_overflow_is_kept_but_closes() {
+        let mut inbound = Inbound::default();
+
+        let too_much = text_of(MAX_UNREAD_BYTES + 1);
+        assert_eq!(inbound.piece(frame(OPCODE_TEXT, true, &too_much)), Some(Incoming::Overflow));
+        assert_eq!(inbound.piece(frame(OPCODE_TEXT, true, b"[1]")), None);
+        assert_eq!(inbound.closed(), Incoming::Closed(1));
+    }
+
+    // Nothing is read while a download runs, and what waits counts as well.
+    #[test]
+    fn messages_waiting_to_be_read_count_against_the_limit() {
+        let mut inbound = Inbound::default();
+        let half = text_of(MAX_UNREAD_BYTES / 2);
+
+        assert!(is_frame(inbound.piece(frame(OPCODE_TEXT, true, &half))));
+        assert!(is_frame(inbound.piece(frame(OPCODE_TEXT, true, &half))));
+        assert_eq!(inbound.piece(frame(OPCODE_TEXT, true, b"[1]")), Some(Incoming::Overflow));
+    }
+
+    #[test]
+    fn a_message_read_makes_room_again() {
+        let mut inbound = Inbound::default();
+        let whole = text_of(MAX_UNREAD_BYTES);
+
+        let Some(Incoming::Frame(first)) = inbound.piece(frame(OPCODE_TEXT, true, &whole)) else {
+            panic!("a frame")
+        };
+        inbound.read(&first);
+
+        assert!(is_frame(inbound.piece(frame(OPCODE_TEXT, true, &whole))));
     }
 }
