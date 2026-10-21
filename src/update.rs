@@ -42,7 +42,9 @@ pub struct FirmwareMeta {
 
 impl UpdatePayload {
     pub fn parse(payload: &Value) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(payload.clone())
+        // Read where it lies: `from_value` would take a copy of the whole
+        // payload first, only to read it and throw the copy away.
+        Self::deserialize(payload)
     }
 
     /// The url and uuid, if this payload actually describes an update.
