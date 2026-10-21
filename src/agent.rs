@@ -820,7 +820,14 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 Err(_) => return Ok(None),
             };
 
-            match link.handle(transport, &mut self.handler, &frame) {
+            // The frame goes as soon as it is handled. An action holds what it
+            // needs of the frame itself, and the frame would otherwise stay
+            // allocated through whatever the action does, a download included.
+            let handled = link.handle(transport, &mut self.handler, &frame);
+            let frame_len = frame.len();
+            drop(frame);
+
+            match handled {
                 Ok(Action::ApplyUpdate(update)) => {
                     if self.apply(&mut link, transport, &update)? {
                         return Ok(Some(Stopped::Rebooting));
@@ -872,8 +879,7 @@ impl<P: Platform, H: UpdateHandler> Agent<P, H> {
                 // like a flaky network.
                 Err(err) => {
                     log::warn!(
-                        "could not handle a {}-byte message from NervesHub ({err}); reconnecting",
-                        frame.len()
+                        "could not handle a {frame_len}-byte message from NervesHub ({err}); reconnecting"
                     );
                     return Ok(None);
                 }
