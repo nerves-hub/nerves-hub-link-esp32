@@ -15,6 +15,14 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
+# The websocket client's two 4 KiB buffers, one each way (see `buffer_size` in
+# transport.rs), allocated for each message instead of held for the life of
+# the connection. That is 8 KiB back whenever no message is going through,
+# which is most of the time, firmware downloads included, when the heap is at
+# its tightest. A message then needs its 4 KiB in one piece, and one that
+# can't get it ends the connection as a network failure would.
+CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
+
 # TLS session resumption: see `TlsSession`. Without the first every handshake
 # is a full one; without the second a saved session carries the server's
 # certificate and is about 1.3 KB rather than 150 bytes.

@@ -372,6 +372,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=10000
 
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 CONFIG_APP_PROJECT_VER="1.0.0"
+
+CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
 ```
 
 The version is not optional. NervesHub reads it from `esp_app_desc_t`, at
@@ -379,6 +381,12 @@ upload and from the running device, and it has to parse as SemVer. Left unset,
 ESP-IDF fills it from `git describe`, which does not. A device reporting an
 unparseable version has no firmware metadata server-side, so it can never match
 a deployment while looking perfectly healthy.
+
+`CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER` is a saving rather than a
+requirement. Without it the websocket client holds its 4 KiB send and receive
+buffers for as long as it is connected; with it they exist only while a
+message goes through, which gives back 8 KiB nearly all the time, firmware
+downloads included, when the heap is at its tightest.
 
 **3. `partitions.csv`**: two app slots, `otadata`, and a `certs` partition.
 Copy the one in this repo. Both app slots must be identical in size and large

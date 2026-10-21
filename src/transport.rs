@@ -204,6 +204,12 @@ impl WebSocketTransport {
             // whether a message survives. Every message NervesHub sends a
             // device -- the largest, an `update` with a signed firmware URL, is
             // a little over 1 KiB -- fits in one.
+            //
+            // There are two of these, one each way. With
+            // CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER, which
+            // `sdkconfig.defaults` sets, each exists only while a message is
+            // going through it; without, both are held for as long as the
+            // client is.
             buffer_size: 4096,
 
             // The IDF client's own bound on connecting -- DNS, TCP, TLS --
