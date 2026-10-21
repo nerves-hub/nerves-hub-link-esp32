@@ -18,10 +18,13 @@
 //! online while it is deaf to everything. Only the agent can rebuild a session,
 //! so a closed socket is reported up to it and it builds a new transport.
 //!
-//! The IDF client's own reconnect is left at its default rather than disabled.
-//! It never gets to act on a close the agent has seen, because the agent drops
-//! the client, and turning it off was tried: it left a device that could not
-//! establish a session at all.
+//! The IDF client's own reconnect is left at its default rather than disabled:
+//! turning it off was tried, and it left a device that could not establish a
+//! session at all. So the client can reconnect by itself, ten seconds after a
+//! socket goes, before the agent has read the close -- the agent doesn't read
+//! while a download runs. The close still ends the session; only those of
+//! attempts that failed while `connect` was waiting are passed over. See
+//! `Inbound::ends_session`.
 //!
 //! # Why mTLS
 //!
@@ -42,7 +45,7 @@
 use core::ffi::{c_int, c_void};
 use std::ffi::CString;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::delay::TickType;
@@ -50,22 +53,13 @@ use esp_idf_svc::sys;
 
 use crate::config::{Config, Credentials};
 use crate::error::Error;
+use crate::inbound::{Inbound, Incoming, Piece, MAX_UNREAD_BYTES};
 use crate::link::Transport;
 use crate::message::Frame;
 use crate::tls;
 
 /// Effectively never: see the client config in [`WebSocketTransport::connect`].
 const WEBSOCKET_PING_INTERVAL_SECS: usize = 24 * 60 * 60;
-
-/// What the client's callback hands to the run loop.
-///
-/// A close has to travel the same channel as the frames, in order with them:
-/// the run loop learns the socket is gone at the point it would have read the
-/// next frame, rather than by a flag it might check at the wrong moment.
-enum Incoming {
-    Frame(Frame),
-    Closed,
-}
 
 pub struct WebSocketTransport {
     client: sys::esp_websocket_client_handle_t,
@@ -101,8 +95,8 @@ impl Drop for WebSocketTransport {
             //
             // Destroying stops the client's task, which closes the connection
             // on its way out, after which no event can arrive, so `events` and
-            // the transports under it can go. `stop` lets the task notice in a
-            // tenth of a second rather than at its next one-second poll.
+            // the transports under it can go. `stop` wakes the task from its
+            // poll at once, rather than when its second is up.
             if let Some(stopper) = &self.stopper {
                 stopper.stop();
             }
@@ -199,11 +193,17 @@ impl WebSocketTransport {
             ping_interval_sec: WEBSOCKET_PING_INTERVAL_SECS,
             disable_pingpong_discon: true,
 
-            // Frames bigger than the buffer arrive in pieces, which `Events`
-            // puts back together, so this is about how many pieces rather than
-            // whether a message survives. Every message NervesHub sends a
-            // device -- the largest, an `update` with a signed firmware URL, is
-            // a little over 1 KiB -- fits in one.
+            // Frames bigger than the buffer arrive in pieces, which `Inbound`
+            // puts back together up to `MAX_UNREAD_BYTES`, so this is about how
+            // many pieces rather than whether a message survives. Every
+            // message NervesHub sends a device -- the largest, an `update` with
+            // a signed firmware URL, is a little over 1 KiB -- fits in one.
+            //
+            // There are two of these, one each way. With
+            // CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER, which
+            // `sdkconfig.defaults` sets, each exists only while a message is
+            // going through it; without, both are held for as long as the
+            // client is.
             buffer_size: 4096,
 
             // The IDF client's own bound on connecting -- DNS, TCP, TLS --
@@ -265,6 +265,13 @@ impl WebSocketTransport {
 
     pub fn is_connected(&self) -> bool {
         unsafe { sys::esp_websocket_client_is_connected(self.client) }
+    }
+
+    /// What the client's callback keeps, which the run loop reads too.
+    fn events(&self) -> MutexGuard<'_, EventState> {
+        // SAFETY: `events` is the box made in `connect`, freed only on drop.
+        let events = unsafe { &*self.events };
+        events.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -347,12 +354,8 @@ fn esp(err: sys::esp_err_t) -> Result<(), Error> {
     sys::EspError::convert(err).map_err(|e| Error::Transport(e.to_string()))
 }
 
-/// The client's events, turned into what the run loop reads.
-///
-/// Text and binary frames and the end of the socket are the run loop's
-/// business; pings, pongs, and the handshake are the client's own. Which kind
-/// of frame arrives is the serializer's choice: text for JSON, binary for
-/// msgpack.
+/// The client's events, turned into what the run loop reads. What a frame
+/// becomes is [`Inbound`]'s to decide; this is the glue.
 ///
 /// Forwarding the close is the whole point. Without it the channel stays open
 /// with nothing ever arriving on it, `recv` reports an idle socket forever, and
@@ -370,12 +373,7 @@ struct Events {
 
 struct EventState {
     tx: Sender<Incoming>,
-    /// A message arriving in pieces: one per buffer-full of a frame, and one
-    /// frame per fragment of a fragmented message.
-    partial: Vec<u8>,
-    /// Whether `partial` is binary. A continuation carries no kind of its
-    /// own; it is whatever the frame that started the message was.
-    partial_binary: bool,
+    inbound: Inbound,
 }
 
 impl Events {
@@ -383,17 +381,11 @@ impl Events {
         Self {
             state: Mutex::new(EventState {
                 tx,
-                partial: Vec::new(),
-                partial_binary: false,
+                inbound: Inbound::default(),
             }),
         }
     }
 }
-
-const OPCODE_CONTINUATION: u8 = 0x0;
-const OPCODE_TEXT: u8 = 0x1;
-const OPCODE_BINARY: u8 = 0x2;
-const OPCODE_CLOSE: u8 = 0x8;
 
 unsafe extern "C" fn on_event(
     arg: *mut c_void,
@@ -411,9 +403,11 @@ unsafe extern "C" fn on_event(
                 state.data(data);
             }
         }
+        sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_CONNECTED => state.inbound.connected(),
         sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DISCONNECTED
         | sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED => {
-            let _ = state.tx.send(Incoming::Closed);
+            let closed = state.inbound.closed();
+            let _ = state.tx.send(closed);
         }
         _ => {}
     }
@@ -421,41 +415,22 @@ unsafe extern "C" fn on_event(
 
 impl EventState {
     fn data(&mut self, data: &sys::esp_websocket_event_data_t) {
-        let piece: &[u8] = if data.data_ptr.is_null() || data.data_len <= 0 {
+        let bytes: &[u8] = if data.data_ptr.is_null() || data.data_len <= 0 {
             &[]
         } else {
             unsafe { core::slice::from_raw_parts(data.data_ptr.cast(), data.data_len as usize) }
         };
 
-        match data.op_code {
-            OPCODE_TEXT | OPCODE_BINARY | OPCODE_CONTINUATION => {
-                // A text or binary frame's first piece starts a message;
-                // anything else carries one on.
-                if data.op_code != OPCODE_CONTINUATION && data.payload_offset == 0 {
-                    self.partial.clear();
-                    self.partial_binary = data.op_code == OPCODE_BINARY;
-                }
-                self.partial.extend_from_slice(piece);
+        let piece = Piece {
+            opcode: data.op_code,
+            fin: data.fin,
+            offset: usize::try_from(data.payload_offset).unwrap_or(0),
+            payload_len: usize::try_from(data.payload_len).unwrap_or(0),
+            bytes,
+        };
 
-                let frame_done = data.payload_offset + data.data_len >= data.payload_len;
-                if frame_done && data.fin {
-                    let message = core::mem::take(&mut self.partial);
-                    if self.partial_binary {
-                        let _ = self.tx.send(Incoming::Frame(Frame::Binary(message)));
-                    } else {
-                        match String::from_utf8(message) {
-                            Ok(text) => {
-                                let _ = self.tx.send(Incoming::Frame(Frame::Text(text)));
-                            }
-                            Err(_) => log::warn!("dropped a text frame that was not UTF-8"),
-                        }
-                    }
-                }
-            }
-            OPCODE_CLOSE => {
-                let _ = self.tx.send(Incoming::Closed);
-            }
-            _ => {}
+        if let Some(incoming) = self.inbound.piece(piece) {
+            let _ = self.tx.send(incoming);
         }
     }
 }
@@ -508,20 +483,28 @@ impl Transport for WebSocketTransport {
 
     fn recv_frame(&mut self) -> Result<Option<Frame>, Error> {
         match self.incoming.recv_timeout(self.recv_timeout) {
-            Ok(Incoming::Frame(frame)) => Ok(Some(frame)),
+            Ok(Incoming::Frame(frame)) => {
+                self.events().inbound.read(&frame);
+                Ok(Some(frame))
+            }
 
-            // A close event from the client that is still connected belongs to
-            // an earlier socket being torn down -- the events arrive on a task
-            // of their own, so a previous client's last words can land here
-            // after this one is up. Only the client's own view of itself
-            // decides that the session is over.
-            Ok(Incoming::Closed) => {
-                if self.is_connected() {
-                    log::debug!("ignoring a close for a socket that is still connected");
-                    Ok(None)
-                } else {
+            Ok(Incoming::Overflow) => {
+                log::warn!(
+                    "more than {MAX_UNREAD_BYTES} bytes arrived from NervesHub without being read; \
+                     dropping the connection"
+                );
+                Err(Error::Transport("too much arrived unread".into()))
+            }
+
+            // Not whether the client is connected now, which it may be again,
+            // by itself, to a socket the session has never joined.
+            Ok(Incoming::Closed(n)) => {
+                if self.events().inbound.ends_session(n) {
                     log::info!("websocket closed");
                     Err(Error::Transport("websocket closed".into()))
+                } else {
+                    log::debug!("ignoring the close of an attempt from before the connection");
+                    Ok(None)
                 }
             }
             // Nothing arrived, which is what most half-seconds look like.

@@ -163,6 +163,55 @@ where
     // size is the value the checksum belongs to.
     let expected_size = update.size.or(content_length);
 
+    let (written, actual) = copy(http, sink, expected_size, progress_step_percent, on_progress)?;
+
+    if let Some(total) = expected_size {
+        if written != total {
+            return Err(Error::Download(format!(
+                "expected {total} bytes, received {written}"
+            )));
+        }
+    }
+
+    if written == 0 {
+        return Err(Error::Download("image was empty".into()));
+    }
+
+    if let Some(expected) = update.checksum.as_deref() {
+        if !checksum::matches(expected, &actual) {
+            return Err(Error::ChecksumMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    Ok(InstallReport {
+        bytes: written,
+        checksum: actual,
+    })
+}
+
+/// Move the image from the network to the sink a chunk at a time, hashing it
+/// on the way. The bytes written and their checksum come back.
+///
+/// Its own function, and never inlined, so the chunk is on the stack only while
+/// the image is being copied. The download's TLS handshake, in `open`, runs on
+/// the same task and is the deepest that stack goes; with the chunk in the
+/// frame alongside it, those 4 KiB came out of the handshake's margin.
+#[inline(never)]
+fn copy<H, S, P>(
+    http: &mut H,
+    sink: &mut S,
+    expected_size: Option<u64>,
+    progress_step_percent: u8,
+    on_progress: &mut P,
+) -> Result<(u64, String), Error>
+where
+    H: HttpStream,
+    S: ImageSink,
+    P: Progress,
+{
     let mut throttle = ProgressThrottle::new(progress_step_percent);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; CHUNK_SIZE];
@@ -201,33 +250,7 @@ where
         }
     }
 
-    if let Some(total) = expected_size {
-        if written != total {
-            return Err(Error::Download(format!(
-                "expected {total} bytes, received {written}"
-            )));
-        }
-    }
-
-    if written == 0 {
-        return Err(Error::Download("image was empty".into()));
-    }
-
-    let actual = hasher.finalize_hex_upper();
-
-    if let Some(expected) = update.checksum.as_deref() {
-        if !checksum::matches(expected, &actual) {
-            return Err(Error::ChecksumMismatch {
-                expected: expected.to_string(),
-                actual,
-            });
-        }
-    }
-
-    Ok(InstallReport {
-        bytes: written,
-        checksum: actual,
-    })
+    Ok((written, hasher.finalize_hex_upper()))
 }
 
 /// Open the image's URL, trying again if it couldn't be opened for a reason

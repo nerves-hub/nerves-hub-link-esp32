@@ -15,6 +15,9 @@
 //! the private key is readable by anyone who can dump flash.
 
 #[cfg(target_os = "espidf")]
+use std::sync::OnceLock;
+
+#[cfg(target_os = "espidf")]
 use esp_idf_svc::nvs::{EspCustomNvsPartition, EspNvs, NvsCustom};
 
 #[cfg(target_os = "espidf")]
@@ -47,8 +50,19 @@ pub const PRIVATE_KEY_KEY: &str = "device.key";
 const MAX_BLOB: usize = 8 * 1024;
 
 /// Read the device's certificate and private key.
+///
+/// Once per boot: later calls hand back the same credentials. mbedTLS needs
+/// them for as long as the program runs, so they are leaked to get there (see
+/// `Credentials`), and reading them afresh would leak them again, which an
+/// application making an agent for each session would do every session.
 #[cfg(target_os = "espidf")]
 pub fn load() -> Result<Credentials, Error> {
+    static LOADED: OnceLock<Credentials> = OnceLock::new();
+
+    if let Some(credentials) = LOADED.get() {
+        return Ok(credentials.clone());
+    }
+
     let partition = EspCustomNvsPartition::take(PARTITION)
         .map_err(|e| Error::Identity(format!("could not open the '{PARTITION}' partition: {e}")))?;
 
@@ -57,10 +71,12 @@ pub fn load() -> Result<Credentials, Error> {
 
     // `client_certificate` owns the NUL-termination and leaking that mbedTLS
     // needs — see `Credentials` — so this only has to get the bytes out.
-    Credentials::client_certificate(
+    let credentials = Credentials::client_certificate(
         read_blob(&nvs, CERTIFICATE_KEY)?,
         read_blob(&nvs, PRIVATE_KEY_KEY)?,
-    )
+    )?;
+
+    Ok(LOADED.get_or_init(|| credentials).clone())
 }
 
 #[cfg(target_os = "espidf")]

@@ -10,21 +10,18 @@ use crate::tls_session::TlsSession;
 
 /// How the device proves who it is.
 ///
-/// Only mTLS is implemented. NervesHub also accepts an HMAC shared secret, but
-/// that path requires reproducing Plug.Crypto's token format — PBKDF2 key
-/// derivation with a negotiated digest/iteration/length, then `MessageVerifier`'s
-/// encoding, over a specific multi-line salt. mTLS is a client certificate
-/// handed to mbedTLS, which ESP-IDF already ships, so there is no crypto to
-/// reimplement and nothing to get subtly and silently wrong.
+/// Either of NervesHub's schemes: a client certificate handed to mbedTLS, or
+/// an HMAC shared secret sent as headers on the websocket upgrade (see
+/// [`crate::shared_secret`]).
 ///
 /// # Why `&'static CStr`
 ///
 /// ESP-IDF's TLS configuration takes `X509<'static>`, and mbedTLS wants PEM as
 /// a NUL-terminated C string. Rather than leak on every reconnect, the bytes
-/// are converted and leaked exactly once by [`Credentials::client_certificate`].
-/// A device's identity lives as long as the program does, so a one-time leak is
-/// an honest representation of that — the alternative is a self-referential
-/// `Config`.
+/// are converted and leaked by [`Credentials::client_certificate`], once per
+/// call, and a clone shares them. A device's identity lives as long as the
+/// program does, so a one-time leak is an honest representation of that — the
+/// alternative is a self-referential `Config`.
 #[derive(Debug, Clone)]
 pub enum Credentials {
     ClientCertificate {
@@ -43,11 +40,6 @@ pub enum Credentials {
 }
 
 impl Credentials {
-    /// Take PEM bytes and prepare them for mbedTLS.
-    ///
-    /// A trailing NUL is appended if absent: mbedTLS reads PEM as a C string,
-    /// and an unterminated blob parses as a truncated certificate, which
-    /// surfaces much later as an opaque handshake failure.
     /// Authenticate with a shared secret rather than a certificate.
     pub fn shared_secret(
         identifier: impl Into<String>,
@@ -60,6 +52,17 @@ impl Credentials {
         }
     }
 
+    /// Take PEM bytes and prepare them for mbedTLS.
+    ///
+    /// A trailing NUL is appended if absent: mbedTLS reads PEM as a C string,
+    /// and an unterminated blob parses as a truncated certificate, which
+    /// surfaces much later as an opaque handshake failure.
+    ///
+    /// The PEM is leaked, for as long as the program runs (see
+    /// [`Credentials`]), so call this once and clone what it returns, which
+    /// leaks nothing more. An application that made fresh credentials for each
+    /// session would lose a certificate and key's worth of heap each time.
+    /// `identity::load` reads the device's once and hands back clones after.
     pub fn client_certificate(certificate: Vec<u8>, private_key: Vec<u8>) -> Result<Self, Error> {
         Ok(Credentials::ClientCertificate {
             certificate: leak_pem(certificate, "certificate")?,

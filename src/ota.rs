@@ -29,15 +29,24 @@ pub enum PendingVerify {
     No,
 }
 
-/// ESP-IDF's `OTA_SIZE_UNKNOWN`. Defined here rather than taken from the
-/// bindings because it is a C `#define` and may not survive bindgen.
+/// ESP-IDF's `OTA_WITH_SEQUENTIAL_WRITES`. Defined here rather than taken from
+/// the bindings because it is a C `#define` and may not survive bindgen.
 ///
-/// We could pass the real size — NervesHub tells us — but `install` does not
-/// hand it to the sink, and with `OTA_SIZE_UNKNOWN` the IDF erases sector by
-/// sector as we write instead of up front. That is slightly slower and
-/// considerably simpler.
+/// It has `esp_ota_write` erase each sector of the slot as the write reaches
+/// it, which is the default for ESP-IDF's own HTTPS OTA too. This used to pass
+/// `OTA_SIZE_UNKNOWN` in the belief that it did the same, but that has
+/// `esp_ota_begin` erase the whole slot up front: 1.875 MiB with the example
+/// partition table, whatever the size of the image or patch, and seconds of
+/// the agent doing nothing else before the download had begun.
+///
+/// The trade is total time on a fast link. A 4 KiB sector takes tens of
+/// milliseconds to erase, about four times as long per byte as the 64 KiB
+/// blocks a whole slot is erased in, so a download WiFi could deliver faster
+/// waits on the flash between chunks. In return nothing is erased that is not
+/// written, the agent is never held up for more than a sector at a time, and
+/// over cellular the network is the slower of the two anyway.
 #[cfg(target_os = "espidf")]
-const OTA_SIZE_UNKNOWN: usize = 0xffff_ffff;
+const OTA_WITH_SEQUENTIAL_WRITES: usize = 0xffff_fffe;
 
 /// First byte of every ESP-IDF application image. The bootloader requires it.
 pub const ESP_IMAGE_MAGIC: u8 = 0xE9;
@@ -85,10 +94,34 @@ pub fn classify(first_byte: u8) -> Payload {
 #[cfg(target_os = "espidf")]
 pub struct OtaWriter {
     partition: *const esp_idf_svc::sys::esp_partition_t,
-    /// `None` once committed or aborted.
-    handle: Option<esp_idf_svc::sys::esp_ota_handle_t>,
+    slot: Slot,
     written: u64,
     mode: Mode,
+}
+
+/// Whether the inactive slot is open for writing.
+///
+/// Not until the first chunk arrives. `esp_ota_begin` changes things before a
+/// byte is written -- with rollback on, it forgets the bootloader's record of
+/// the image in the slot, which is what [`auto_revert_detected`] reads -- and a
+/// download that never starts, from an expired URL or storage that stays busy,
+/// should leave the device as it found it.
+#[cfg(target_os = "espidf")]
+enum Slot {
+    Unopened,
+    Open(esp_idf_svc::sys::esp_ota_handle_t),
+    /// Committed or aborted.
+    Finished,
+}
+
+#[cfg(target_os = "espidf")]
+impl Slot {
+    fn handle(&self) -> Option<esp_idf_svc::sys::esp_ota_handle_t> {
+        match self {
+            Slot::Open(handle) => Some(*handle),
+            _ => None,
+        }
+    }
 }
 
 /// How the bytes being written are being interpreted.
@@ -167,35 +200,47 @@ unsafe extern "C" fn patch_write(
 
 #[cfg(target_os = "espidf")]
 impl OtaWriter {
+    /// Find the slot to write. It is left alone until the first chunk arrives,
+    /// so a download that never starts changes nothing.
     pub fn begin() -> Result<Self, Error> {
         use esp_idf_svc::sys;
 
         // SAFETY: a null `start_from` asks for the partition after the running
         // one, which is what we want; the returned pointer is into the
         // flash-mapped partition table and outlives us.
-        unsafe {
-            let partition = sys::esp_ota_get_next_update_partition(core::ptr::null());
+        let partition = unsafe { sys::esp_ota_get_next_update_partition(core::ptr::null()) };
 
-            if partition.is_null() {
-                return Err(Error::Ota(
-                    "no inactive OTA partition — the partition table needs ota_0, ota_1 and otadata"
-                        .into(),
-                ));
-            }
-
-            let mut handle: sys::esp_ota_handle_t = Default::default();
-            check(
-                sys::esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &mut handle),
-                "esp_ota_begin",
-            )?;
-
-            Ok(Self {
-                partition,
-                handle: Some(handle),
-                written: 0,
-                mode: Mode::Undecided,
-            })
+        if partition.is_null() {
+            return Err(Error::Ota(
+                "no inactive OTA partition — the partition table needs ota_0, ota_1 and otadata"
+                    .into(),
+            ));
         }
+
+        Ok(Self {
+            partition,
+            slot: Slot::Unopened,
+            written: 0,
+            mode: Mode::Undecided,
+        })
+    }
+
+    /// Open the slot, for the first chunk.
+    fn open(&mut self) -> Result<(), Error> {
+        use esp_idf_svc::sys;
+
+        let mut handle: sys::esp_ota_handle_t = Default::default();
+
+        // SAFETY: `self.partition` came from esp_ota_get_next_update_partition,
+        // and `handle` is only written by the call.
+        check(
+            unsafe { sys::esp_ota_begin(self.partition, OTA_WITH_SEQUENTIAL_WRITES, &mut handle) },
+            "esp_ota_begin",
+        )?;
+
+        self.slot = Slot::Open(handle);
+
+        Ok(())
     }
 
     /// Bytes written into the slot.
@@ -215,7 +260,8 @@ impl OtaWriter {
         use esp_idf_svc::sys;
 
         let ota = self
-            .handle
+            .slot
+            .handle()
             .ok_or_else(|| Error::Ota("patch started after the update was finished".into()))?;
 
         // SAFETY: returns a pointer into the flash-mapped partition table.
@@ -266,6 +312,10 @@ impl ImageSink for OtaWriter {
             return Ok(());
         }
 
+        if matches!(self.slot, Slot::Unopened) {
+            self.open()?;
+        }
+
         // The first byte decides, and only the first byte of the whole
         // download -- not of each chunk.
         if matches!(self.mode, Mode::Undecided) {
@@ -299,7 +349,8 @@ impl ImageSink for OtaWriter {
 
             _ => {
                 let handle = self
-                    .handle
+                    .slot
+                    .handle()
                     .ok_or_else(|| Error::Ota("write after the update was finished".into()))?;
 
                 // SAFETY: `chunk` is valid for `len` bytes for the duration of
@@ -343,10 +394,11 @@ impl ImageSink for OtaWriter {
             finalized?;
         }
 
-        let handle = self
-            .handle
-            .take()
-            .ok_or_else(|| Error::Ota("commit after the update was finished".into()))?;
+        let handle = match core::mem::replace(&mut self.slot, Slot::Finished) {
+            Slot::Open(handle) => handle,
+            Slot::Unopened => return Err(Error::Ota("commit with nothing written".into())),
+            Slot::Finished => return Err(Error::Ota("commit after the update was finished".into())),
+        };
 
         // SAFETY: `handle` came from esp_ota_begin and has not been ended;
         // `self.partition` is the pointer esp_ota_begin was given.
@@ -372,7 +424,8 @@ impl ImageSink for OtaWriter {
             self.mode = Mode::Image;
         }
 
-        if let Some(handle) = self.handle.take() {
+        // A slot never opened has nothing to release, and was never touched.
+        if let Slot::Open(handle) = core::mem::replace(&mut self.slot, Slot::Finished) {
             // Releases the handle without touching the boot partition, so the
             // currently running image stays bootable.
             unsafe {

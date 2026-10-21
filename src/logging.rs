@@ -204,6 +204,30 @@ impl LogBuffer {
         backlog.lines.push_back(line);
     }
 
+    /// Whether a line could be queued now, counting it as lost if not, as
+    /// [`push`](Self::push) would.
+    ///
+    /// For the logger to ask before it builds a line. Formatting the message
+    /// and allocating the line's strings is most of what logging one costs,
+    /// and a device offline long enough to fill the backlog would otherwise
+    /// pay that on every call, only for `push` to throw the line away.
+    ///
+    /// It never refuses what `push` would take: no line costs less than the
+    /// line itself, so a backlog without room for that has room for nothing.
+    #[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
+    fn has_room(&self) -> bool {
+        let room = self.backlog.lock().is_ok_and(|backlog| {
+            backlog.lines.len() < self.capacity
+                && backlog.bytes + core::mem::size_of::<LogLine>() <= self.max_bytes
+        });
+
+        if !room {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+
+        room
+    }
+
     /// The next line to send, stamped if it was logged before the clock was.
     ///
     /// A line with no time is discarded by NervesHub without a reply, so an
@@ -340,6 +364,12 @@ impl log::Log for Capture {
         self.inner.log(record);
 
         if record.level() > self.buffer.level() {
+            return;
+        }
+
+        // Before the line is built, not after: building it is most of what it
+        // costs, and a full backlog would only throw it away.
+        if !self.buffer.has_room() {
             return;
         }
 
@@ -579,6 +609,40 @@ mod tests {
         assert_eq!(buffer.len(), 2);
         assert_eq!(buffer.bytes(), cost * 2);
         assert_eq!(buffer.dropped(), 1);
+    }
+
+    // The logger asks before it builds a line, so a device offline long enough
+    // to fill the backlog stops paying for lines it cannot keep. They are
+    // still counted, for the note that follows the backlog out.
+    #[test]
+    fn a_full_backlog_turns_a_line_away_before_it_is_built() {
+        let buffer = LogBuffer::new(1);
+        buffer.push(line("kept"));
+
+        assert!(!buffer.has_room());
+        assert_eq!(buffer.dropped(), 1);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn a_backlog_full_of_bytes_turns_a_line_away_too() {
+        let buffer = LogBuffer::new(64).max_bytes(heap_cost(&line("x")));
+        buffer.push(line("x"));
+
+        assert!(!buffer.has_room());
+        assert_eq!(buffer.dropped(), 1);
+    }
+
+    // Asking first must never cost a line that `push` would have kept.
+    #[test]
+    fn room_for_the_smallest_line_is_room_enough_to_ask() {
+        let buffer = LogBuffer::new(64).max_bytes(heap_cost(&line("x")));
+
+        assert!(buffer.has_room());
+        assert_eq!(buffer.dropped(), 0);
+
+        buffer.push(line("x"));
+        assert_eq!(buffer.len(), 1);
     }
 
     #[test]

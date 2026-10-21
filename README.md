@@ -322,6 +322,11 @@ above for TLS 1.2: a saved 1.2 session carries the server's certificate again.
 A saved 1.3 session never does, since mbedTLS writes only the resumption secret
 and the server's ticket, so its size depends on that ticket.
 
+Keeping the peer certificate costs memory while connected, too: every open TLS
+connection holds the certificate chain the server sent, parsed, for as long as
+it is open. That is a few KiB a connection, and an update has two open, the
+websocket and the download.
+
 With both lines, a device asks for 1.3 and falls back to 1.2 if the server
 doesn't speak it. `Config::tls_version` can hold it to one version.
 `TlsVersion::Tls13` on a build without TLS 1.3 refuses to connect, where
@@ -372,6 +377,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=10000
 
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 CONFIG_APP_PROJECT_VER="1.0.0"
+
+CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
 ```
 
 The version is not optional. NervesHub reads it from `esp_app_desc_t`, at
@@ -379,6 +386,20 @@ upload and from the running device, and it has to parse as SemVer. Left unset,
 ESP-IDF fills it from `git describe`, which does not. A device reporting an
 unparseable version has no firmware metadata server-side, so it can never match
 a deployment while looking perfectly healthy.
+
+`CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER` is a saving rather than a
+requirement. Without it the websocket client holds its 4 KiB send and receive
+buffers for as long as it is connected; with it they exist only while a
+message goes through, which gives back 8 KiB nearly all the time, firmware
+downloads included, when the heap is at its tightest.
+
+mbedTLS has a bigger saving of the same kind, not yet tried with this crate.
+Each TLS connection holds a 16 KiB receive buffer and a 4 KiB send buffer for
+as long as it is open, and an update has two open. `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y`
+allocates them only while a record goes through, which would give back most of
+the idle websocket's 20 KiB. The download would pay for it: a buffer the size
+of each record it receives, up to 16 KiB and in one piece, allocated and freed
+again record by record. Measure before turning it on.
 
 **3. `partitions.csv`**: two app slots, `otadata`, and a `certs` partition.
 Copy the one in this repo. Both app slots must be identical in size and large
@@ -689,6 +710,7 @@ src/
   link.rs       the channel state machine     (trait: Transport)
   install.rs    download -> verify -> commit  (traits: HttpStream, ImageSink)
   message.rs    Phoenix v2 frames, topics, event names
+  inbound.rs    the socket's pieces -> whole messages, for transport.rs
   metadata.rs   esp_app_desc_t -> join payload
   update.rs     update payload, decisions, progress throttling
   checksum.rs   SHA-256 in NervesHub's format
