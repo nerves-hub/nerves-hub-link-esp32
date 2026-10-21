@@ -45,6 +45,9 @@ pub trait Platform {
     fn http(&mut self) -> Result<Self::Http, Error>;
 
     /// Open the inactive image slot for writing.
+    ///
+    /// Asked before the download is, which may still fail to start, so a sink
+    /// should leave the slot alone until its first write.
     fn begin_update(&mut self) -> Result<Self::Sink, Error>;
 
     /// Whether this boot is an unconfirmed update.
