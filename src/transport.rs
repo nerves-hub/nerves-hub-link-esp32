@@ -95,8 +95,8 @@ impl Drop for WebSocketTransport {
             //
             // Destroying stops the client's task, which closes the connection
             // on its way out, after which no event can arrive, so `events` and
-            // the transports under it can go. `stop` lets the task notice in a
-            // tenth of a second rather than at its next one-second poll.
+            // the transports under it can go. `stop` wakes the task from its
+            // poll at once, rather than when its second is up.
             if let Some(stopper) = &self.stopper {
                 stopper.stop();
             }

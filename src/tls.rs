@@ -22,8 +22,8 @@
 use core::ffi::{c_char, c_int, CStr};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use esp_idf_svc::sys;
 
@@ -50,11 +50,27 @@ struct Context {
     tls: *mut sys::esp_tls_t,
     sockfd: c_int,
     /// Shared with the [`Stopper`], on the thread that owns the client.
-    stopping: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     /// A TLS 1.3 handshake whose ticket hasn't come yet: what it was, for
     /// when the ticket is stored.
     #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
     ticket_due: Option<Handshake>,
+}
+
+/// What a [`Stopper`] shares with its transport.
+struct Stop {
+    stopping: AtomicBool,
+    /// The connection's socket while there is one, for [`Stopper::stop`] to
+    /// shut down. Locked while it does, and by [`Context::close`] to give the
+    /// socket up before closing it, so a stop can never reach a socket that
+    /// has been closed and its number handed to another connection.
+    socket: Mutex<c_int>,
+}
+
+impl Stop {
+    fn socket(&self) -> MutexGuard<'_, c_int> {
+        self.socket.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// A new transport, owned by the caller until `esp_transport_destroy`, and
@@ -77,13 +93,16 @@ pub(crate) fn transport(
         return Err(Error::Transport("no memory for the TLS transport".into()));
     }
 
-    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(Stop {
+        stopping: AtomicBool::new(false),
+        socket: Mutex::new(-1),
+    });
     let context = Box::into_raw(Box::new(Context {
         cfg: base_config(&settings),
         settings,
         tls: ptr::null_mut(),
         sockfd: -1,
-        stopping: Arc::clone(&stopping),
+        stop: Arc::clone(&stop),
         #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
         ticket_due: None,
     }));
@@ -105,7 +124,7 @@ pub(crate) fn transport(
         sys::esp_transport_set_default_port(t, 443);
     }
 
-    Ok((t, Stopper(stopping)))
+    Ok((t, Stopper(stop)))
 }
 
 fn base_config(settings: &Settings) -> sys::esp_tls_cfg_t {
@@ -145,6 +164,9 @@ unsafe fn context<'a>(t: sys::esp_transport_handle_t) -> Option<&'a mut Context>
 
 impl Context {
     fn close(&mut self) {
+        // Given up before the connection is closed: see `Stop::socket`.
+        *self.stop.socket() = -1;
+
         if !self.tls.is_null() {
             unsafe { sys::esp_tls_conn_destroy(self.tls) };
             self.tls = ptr::null_mut();
@@ -165,7 +187,11 @@ unsafe extern "C" fn connect(
 ) -> c_int {
     let Some(ctx) = context(t) else { return -1 };
     ctx.close();
-    ctx.stopping.store(false, Ordering::Relaxed);
+
+    // A transport being destroyed connects to nothing more.
+    if ctx.stop.stopping.load(Ordering::Acquire) {
+        return -1;
+    }
 
     ctx.cfg.timeout_ms = timeout_ms;
 
@@ -219,6 +245,7 @@ unsafe extern "C" fn connect(
         return -1;
     }
     ctx.tls = tls;
+    *ctx.stop.socket() = ctx.sockfd;
 
     if let Some(protocol) = protocol(tls) {
         ctx.settings.session.negotiated(protocol);
@@ -345,7 +372,7 @@ impl Context {
             return buffered as c_int;
         }
 
-        unsafe { wait(self.sockfd, Direction::Read, timeout_ms, &self.stopping) }
+        unsafe { wait(self.sockfd, Direction::Read, timeout_ms, &self.stop) }
     }
 
     fn poll_write(&self, timeout_ms: c_int) -> c_int {
@@ -353,7 +380,7 @@ impl Context {
             return -1;
         }
 
-        unsafe { wait(self.sockfd, Direction::Write, timeout_ms, &self.stopping) }
+        unsafe { wait(self.sockfd, Direction::Write, timeout_ms, &self.stop) }
     }
 }
 
@@ -378,20 +405,29 @@ unsafe extern "C" fn destroy(t: sys::esp_transport_handle_t) -> c_int {
 ///
 /// The websocket client stops its task by clearing a flag the task reads
 /// between polls, and its idle poll waits a second for the socket. [`stop`]
-/// ends that wait early, so a client being destroyed stops in a tenth of a
-/// second rather than up to a whole one with the modem on.
+/// ends that wait at once by shutting the socket down, which wakes the
+/// `select` it is in, so a client being destroyed stops straight away rather
+/// than up to a second later with the modem on. Waits used to look for a stop
+/// every tenth of a second instead, which woke the task ten times a second
+/// for as long as a connection was up.
 ///
 /// [`stop`]: Stopper::stop
-pub(crate) struct Stopper(Arc<AtomicBool>);
+pub(crate) struct Stopper(Arc<Stop>);
 
 impl Stopper {
+    /// For good: a stopped transport waits for nothing and connects to
+    /// nothing more.
     pub(crate) fn stop(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.stopping.store(true, Ordering::Release);
+
+        let socket = self.0.socket();
+        if *socket >= 0 {
+            // SAFETY: a published socket is open: `Context::close` takes this
+            // lock to give it up before closing it.
+            unsafe { sys::lwip_shutdown(*socket, sys::SHUT_RDWR as c_int) };
+        }
     }
 }
-
-/// How often a wait looks up to see whether it should stop.
-const STOP_CHECK: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -399,49 +435,47 @@ enum Direction {
     Write,
 }
 
-/// `select` on one socket: >0 ready, 0 timed out, -1 failed. A negative
-/// timeout waits forever, as the transport API defines it.
+/// `select` on one socket: >0 ready, 0 timed out or stopped, -1 failed. A
+/// negative timeout waits forever, as the transport API defines it.
 ///
-/// In slices of [`STOP_CHECK`], so that [`stop`] is seen within one. A wait
-/// only ends early when asked to stop; otherwise it runs its full timeout.
-unsafe fn wait(fd: c_int, direction: Direction, timeout_ms: c_int, stopping: &AtomicBool) -> c_int {
-    let deadline =
-        u64::try_from(timeout_ms).ok().map(|ms| Instant::now() + Duration::from_millis(ms));
-
-    loop {
-        let slice = match deadline {
-            Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(STOP_CHECK),
-            None => STOP_CHECK,
-        };
-
-        let n = select_once(fd, direction, slice);
-        if n != 0 || stopping.load(Ordering::Relaxed) {
-            return n;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return 0;
-        }
+/// A stop that comes before the wait ends it at once, and one that comes
+/// during it shuts the socket down, which wakes the `select`. Either reads as
+/// a timeout, which the client takes for a quiet poll before it checks
+/// whether it should still be running.
+unsafe fn wait(fd: c_int, direction: Direction, timeout_ms: c_int, stop: &Stop) -> c_int {
+    if stop.stopping.load(Ordering::Acquire) {
+        return 0;
     }
+
+    let timeout = u64::try_from(timeout_ms).ok().map(Duration::from_millis);
+    let n = select_once(fd, direction, timeout);
+
+    if stop.stopping.load(Ordering::Acquire) {
+        return 0;
+    }
+    n
 }
 
-unsafe fn select_once(fd: c_int, direction: Direction, timeout: Duration) -> c_int {
+/// `None` waits until the socket is ready.
+unsafe fn select_once(fd: c_int, direction: Direction, timeout: Option<Duration>) -> c_int {
     let mut ready: sys::fd_set = core::mem::zeroed();
     let mut failed: sys::fd_set = core::mem::zeroed();
     if !add(&mut ready, fd) || !add(&mut failed, fd) {
         return -1;
     }
 
-    let mut timeout = sys::timeval {
+    let mut timeout = timeout.map(|timeout| sys::timeval {
         tv_sec: timeout.as_secs() as _,
         tv_usec: timeout.subsec_micros() as _,
-    };
+    });
+    let timeout = timeout.as_mut().map_or(ptr::null_mut(), |timeout| timeout as *mut _);
 
     let (reads, writes) = match direction {
         Direction::Read => (&mut ready as *mut _, ptr::null_mut()),
         Direction::Write => (ptr::null_mut(), &mut ready as *mut _),
     };
 
-    let n = sys::select(fd + 1, reads, writes, &mut failed, &mut timeout);
+    let n = sys::select(fd + 1, reads, writes, &mut failed, timeout);
     if n > 0 && contains(&failed, fd) {
         return -1;
     }
