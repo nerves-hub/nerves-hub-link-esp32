@@ -406,15 +406,16 @@ For **shared secrets**, nothing is provisioned: the identifier and secret are
 configuration, and a product-wide secret registers unknown devices on first
 connection. That is the quickest way to a working bench.
 
-For **mTLS**, a device certificate in NVS, signed by a CA registered to your
-organization. NervesHub identifies a device by its client certificate: the
-first time it sees one, it checks the signer against the organization's CAs,
-and from then on it knows the certificate by the SHA-1 fingerprint of its DER.
-Don't use `nh`'s `--self-signed` for this: NervesHub refuses a self-signed
-device certificate in the TLS handshake, even one uploaded for the device.
+For **mTLS**, a device certificate in NVS. NervesHub identifies a device by its
+client certificate, which it knows by the SHA-1 fingerprint of its DER. A
+certificate gets on file in one of two ways, and
+[`nh`](https://github.com/nerves-hub/nh) does the identity half of both.
 
-[`nh`](https://github.com/nerves-hub/nh) does the identity half. Once per
-organization, make a CA and register it:
+**Signed by a CA registered to your organization**, the recommended route.
+NervesHub checks a certificate it hasn't seen against the organization's CAs,
+so nothing is uploaded per device, and with Just In Time Provisioning the
+device itself is created on its first connection. Once per organization, make a
+CA and register it:
 
 ```bash
 nh ca generate --upload
@@ -437,14 +438,30 @@ nh device certificates generate my-device-001 --ca 2026-10-21-09-15-02
 
 `--ca` takes the time the CA's files are named by. That generates a secp256r1
 key and a client certificate signed by the CA, with the device identifier as
-the common name. Files land in `~/.nh/certificates/<org>/`. Nothing is
-uploaded: on the device's first connection, NervesHub checks the certificate
-against the CA, creates the device in the JITP product and pins the
-certificate. Without JITP the device has to exist in NervesHub first; its
-first connection then registers the certificate.
+the common name. Nothing is uploaded: on the device's first connection,
+NervesHub checks the certificate against the CA, creates the device in the
+JITP product and pins the certificate. Without JITP the device has to exist in
+NervesHub first; its first connection then registers the certificate.
 
-Then write them into the `certs` partition and flash. `scripts/provision.sh`
-does this, or by hand:
+**Self-signed**, with no CA to look after. NervesHub has nothing to check a
+self-signed certificate against, so it has to be uploaded for a device that
+already exists, before that device connects:
+
+```bash
+nh device create my-device-001
+nh device certificates generate my-device-001 --self-signed --upload
+```
+
+That generates a secp256r1 key and a self-signed client certificate with the
+device identifier as the common name, and registers the certificate with the
+device. NervesHub accepts an uploaded self-signed certificate once it has
+[nerves_hub_web#3184](https://github.com/nerves-hub/nerves_hub_web/pull/3184);
+without that, it refuses a self-signed certificate in the TLS handshake,
+uploaded or not.
+
+Either way, the key and certificate land in `~/.nh/certificates/<org>/`. Write
+them into the `certs` partition and flash. `scripts/provision.sh` does this, or
+by hand:
 
 ```bash
 cat > nvs.csv <<'CSV'
