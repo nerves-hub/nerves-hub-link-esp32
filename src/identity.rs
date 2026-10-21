@@ -1,7 +1,7 @@
 //! Loading the device's client certificate from NVS.
 //!
-//! **Not yet built or run.** The `esp-idf-svc` NVS API needs checking against
-//! the version you build with.
+//! Run on hardware: an ESP32-C6 built against `esp-idf-svc` 0.53 read its
+//! certificate and key from here and signed in to NervesCloud with them.
 //!
 //! # Why not in the image
 //!
