@@ -51,9 +51,6 @@ struct Context {
     sockfd: c_int,
     /// Shared with the [`Stopper`], on the thread that owns the client.
     stopping: Arc<AtomicBool>,
-    /// The session being offered, which has to outlive the handshake.
-    #[cfg(esp_idf_esp_tls_client_session_tickets)]
-    offered: Option<LoadedSession>,
     /// A TLS 1.3 handshake whose ticket hasn't come yet: what it was, for
     /// when the ticket is stored.
     #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
@@ -87,8 +84,6 @@ pub(crate) fn transport(
         tls: ptr::null_mut(),
         sockfd: -1,
         stopping: Arc::clone(&stopping),
-        #[cfg(esp_idf_esp_tls_client_session_tickets)]
-        offered: None,
         #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
         ticket_due: None,
     }));
@@ -155,10 +150,6 @@ impl Context {
             self.tls = ptr::null_mut();
         }
         self.sockfd = -1;
-        #[cfg(esp_idf_esp_tls_client_session_tickets)]
-        {
-            self.offered = None;
-        }
         #[cfg(all(esp_idf_esp_tls_client_session_tickets, esp_idf_mbedtls_ssl_proto_tls1_3))]
         {
             self.ticket_due = None;
@@ -178,24 +169,36 @@ unsafe extern "C" fn connect(
 
     ctx.cfg.timeout_ms = timeout_ms;
 
-    #[cfg(esp_idf_esp_tls_client_session_tickets)]
-    let offered = ctx.settings.session.saved();
-    #[cfg(esp_idf_esp_tls_client_session_tickets)]
-    {
-        ctx.offered = offered.as_deref().and_then(LoadedSession::load);
-        ctx.cfg.client_session = match ctx.offered.as_mut() {
-            Some(session) => session.as_mut_ptr(),
-            None => ptr::null_mut(),
-        };
-    }
-
     let tls = sys::esp_tls_init();
     if tls.is_null() {
         return -1;
     }
 
+    // The saved session, in the form esp-tls offers, for the handshake only:
+    // esp-tls copies it into the connection, so it goes as soon as the
+    // handshake has, rather than being held as long as the connection is.
+    #[cfg(esp_idf_esp_tls_client_session_tickets)]
+    let offered = ctx.settings.session.saved();
+    #[cfg(esp_idf_esp_tls_client_session_tickets)]
+    let mut loaded = offered.as_deref().and_then(LoadedSession::load);
+    #[cfg(esp_idf_esp_tls_client_session_tickets)]
+    {
+        ctx.cfg.client_session = match loaded.as_mut() {
+            Some(session) => session.as_mut_ptr(),
+            None => ptr::null_mut(),
+        };
+    }
+
     let host_len = CStr::from_ptr(host).to_bytes().len();
-    if sys::esp_tls_conn_new_sync(host, host_len as c_int, port, &ctx.cfg, tls) <= 0 {
+    let connected = sys::esp_tls_conn_new_sync(host, host_len as c_int, port, &ctx.cfg, tls);
+
+    #[cfg(esp_idf_esp_tls_client_session_tickets)]
+    {
+        ctx.cfg.client_session = ptr::null_mut();
+        drop(loaded);
+    }
+
+    if connected <= 0 {
         report_tls_error(t, tls);
         sys::esp_tls_conn_destroy(tls);
 
