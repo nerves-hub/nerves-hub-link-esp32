@@ -50,22 +50,13 @@ use esp_idf_svc::sys;
 
 use crate::config::{Config, Credentials};
 use crate::error::Error;
+use crate::inbound::{Inbound, Incoming, Piece};
 use crate::link::Transport;
 use crate::message::Frame;
 use crate::tls;
 
 /// Effectively never: see the client config in [`WebSocketTransport::connect`].
 const WEBSOCKET_PING_INTERVAL_SECS: usize = 24 * 60 * 60;
-
-/// What the client's callback hands to the run loop.
-///
-/// A close has to travel the same channel as the frames, in order with them:
-/// the run loop learns the socket is gone at the point it would have read the
-/// next frame, rather than by a flag it might check at the wrong moment.
-enum Incoming {
-    Frame(Frame),
-    Closed,
-}
 
 pub struct WebSocketTransport {
     client: sys::esp_websocket_client_handle_t,
@@ -353,12 +344,8 @@ fn esp(err: sys::esp_err_t) -> Result<(), Error> {
     sys::EspError::convert(err).map_err(|e| Error::Transport(e.to_string()))
 }
 
-/// The client's events, turned into what the run loop reads.
-///
-/// Text and binary frames and the end of the socket are the run loop's
-/// business; pings, pongs, and the handshake are the client's own. Which kind
-/// of frame arrives is the serializer's choice: text for JSON, binary for
-/// msgpack.
+/// The client's events, turned into what the run loop reads. What a frame
+/// becomes is [`Inbound`]'s to decide; this is the glue.
 ///
 /// Forwarding the close is the whole point. Without it the channel stays open
 /// with nothing ever arriving on it, `recv` reports an idle socket forever, and
@@ -376,12 +363,7 @@ struct Events {
 
 struct EventState {
     tx: Sender<Incoming>,
-    /// A message arriving in pieces: one per buffer-full of a frame, and one
-    /// frame per fragment of a fragmented message.
-    partial: Vec<u8>,
-    /// Whether `partial` is binary. A continuation carries no kind of its
-    /// own; it is whatever the frame that started the message was.
-    partial_binary: bool,
+    inbound: Inbound,
 }
 
 impl Events {
@@ -389,17 +371,11 @@ impl Events {
         Self {
             state: Mutex::new(EventState {
                 tx,
-                partial: Vec::new(),
-                partial_binary: false,
+                inbound: Inbound::default(),
             }),
         }
     }
 }
-
-const OPCODE_CONTINUATION: u8 = 0x0;
-const OPCODE_TEXT: u8 = 0x1;
-const OPCODE_BINARY: u8 = 0x2;
-const OPCODE_CLOSE: u8 = 0x8;
 
 unsafe extern "C" fn on_event(
     arg: *mut c_void,
@@ -427,41 +403,22 @@ unsafe extern "C" fn on_event(
 
 impl EventState {
     fn data(&mut self, data: &sys::esp_websocket_event_data_t) {
-        let piece: &[u8] = if data.data_ptr.is_null() || data.data_len <= 0 {
+        let bytes: &[u8] = if data.data_ptr.is_null() || data.data_len <= 0 {
             &[]
         } else {
             unsafe { core::slice::from_raw_parts(data.data_ptr.cast(), data.data_len as usize) }
         };
 
-        match data.op_code {
-            OPCODE_TEXT | OPCODE_BINARY | OPCODE_CONTINUATION => {
-                // A text or binary frame's first piece starts a message;
-                // anything else carries one on.
-                if data.op_code != OPCODE_CONTINUATION && data.payload_offset == 0 {
-                    self.partial.clear();
-                    self.partial_binary = data.op_code == OPCODE_BINARY;
-                }
-                self.partial.extend_from_slice(piece);
+        let piece = Piece {
+            opcode: data.op_code,
+            fin: data.fin,
+            offset: usize::try_from(data.payload_offset).unwrap_or(0),
+            payload_len: usize::try_from(data.payload_len).unwrap_or(0),
+            bytes,
+        };
 
-                let frame_done = data.payload_offset + data.data_len >= data.payload_len;
-                if frame_done && data.fin {
-                    let message = core::mem::take(&mut self.partial);
-                    if self.partial_binary {
-                        let _ = self.tx.send(Incoming::Frame(Frame::Binary(message)));
-                    } else {
-                        match String::from_utf8(message) {
-                            Ok(text) => {
-                                let _ = self.tx.send(Incoming::Frame(Frame::Text(text)));
-                            }
-                            Err(_) => log::warn!("dropped a text frame that was not UTF-8"),
-                        }
-                    }
-                }
-            }
-            OPCODE_CLOSE => {
-                let _ = self.tx.send(Incoming::Closed);
-            }
-            _ => {}
+        if let Some(incoming) = self.inbound.piece(piece) {
+            let _ = self.tx.send(incoming);
         }
     }
 }

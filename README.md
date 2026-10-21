@@ -656,6 +656,7 @@ src/
   link.rs       the channel state machine     (trait: Transport)
   install.rs    download -> verify -> commit  (traits: HttpStream, ImageSink)
   message.rs    Phoenix v2 frames, topics, event names
+  inbound.rs    the socket's pieces -> whole messages, for transport.rs
   metadata.rs   esp_app_desc_t -> join payload
   update.rs     update payload, decisions, progress throttling
   checksum.rs   SHA-256 in NervesHub's format

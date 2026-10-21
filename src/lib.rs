@@ -54,6 +54,7 @@ pub mod health;
 pub mod esp;
 pub mod http;
 pub mod identity;
+mod inbound;
 pub mod install;
 pub mod link;
 pub mod logging;
