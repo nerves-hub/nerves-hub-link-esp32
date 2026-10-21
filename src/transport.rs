@@ -18,10 +18,13 @@
 //! online while it is deaf to everything. Only the agent can rebuild a session,
 //! so a closed socket is reported up to it and it builds a new transport.
 //!
-//! The IDF client's own reconnect is left at its default rather than disabled.
-//! It never gets to act on a close the agent has seen, because the agent drops
-//! the client, and turning it off was tried: it left a device that could not
-//! establish a session at all.
+//! The IDF client's own reconnect is left at its default rather than disabled:
+//! turning it off was tried, and it left a device that could not establish a
+//! session at all. So the client can reconnect by itself, ten seconds after a
+//! socket goes, before the agent has read the close -- the agent doesn't read
+//! while a download runs. The close still ends the session; only those of
+//! attempts that failed while `connect` was waiting are passed over. See
+//! `Inbound::ends_session`.
 //!
 //! # Why mTLS
 //!
@@ -42,7 +45,7 @@
 use core::ffi::{c_int, c_void};
 use std::ffi::CString;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::delay::TickType;
@@ -263,6 +266,13 @@ impl WebSocketTransport {
     pub fn is_connected(&self) -> bool {
         unsafe { sys::esp_websocket_client_is_connected(self.client) }
     }
+
+    /// What the client's callback keeps, which the run loop reads too.
+    fn events(&self) -> MutexGuard<'_, EventState> {
+        // SAFETY: `events` is the box made in `connect`, freed only on drop.
+        let events = unsafe { &*self.events };
+        events.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// The pieces of a transport not yet assembled, released in reverse if
@@ -393,9 +403,11 @@ unsafe extern "C" fn on_event(
                 state.data(data);
             }
         }
+        sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_CONNECTED => state.inbound.connected(),
         sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DISCONNECTED
         | sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED => {
-            let _ = state.tx.send(Incoming::Closed);
+            let closed = state.inbound.closed();
+            let _ = state.tx.send(closed);
         }
         _ => {}
     }
@@ -473,18 +485,15 @@ impl Transport for WebSocketTransport {
         match self.incoming.recv_timeout(self.recv_timeout) {
             Ok(Incoming::Frame(frame)) => Ok(Some(frame)),
 
-            // A close event from the client that is still connected belongs to
-            // an earlier socket being torn down -- the events arrive on a task
-            // of their own, so a previous client's last words can land here
-            // after this one is up. Only the client's own view of itself
-            // decides that the session is over.
-            Ok(Incoming::Closed) => {
-                if self.is_connected() {
-                    log::debug!("ignoring a close for a socket that is still connected");
-                    Ok(None)
-                } else {
+            // Not whether the client is connected now, which it may be again,
+            // by itself, to a socket the session has never joined.
+            Ok(Incoming::Closed(n)) => {
+                if self.events().inbound.ends_session(n) {
                     log::info!("websocket closed");
                     Err(Error::Transport("websocket closed".into()))
+                } else {
+                    log::debug!("ignoring the close of an attempt from before the connection");
+                    Ok(None)
                 }
             }
             // Nothing arrived, which is what most half-seconds look like.

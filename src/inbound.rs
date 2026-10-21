@@ -20,7 +20,9 @@ use crate::message::Frame;
 #[derive(Debug, PartialEq)]
 pub(crate) enum Incoming {
     Frame(Frame),
-    Closed,
+    /// The client's `n`th report of a closed socket, counting from 1. See
+    /// [`Inbound::ends_session`].
+    Closed(u32),
 }
 
 pub(crate) const OPCODE_CONTINUATION: u8 = 0x0;
@@ -49,9 +51,41 @@ pub(crate) struct Inbound {
     /// Whether `partial` is binary. A continuation carries no kind of its
     /// own; it is whatever the frame that started the message was.
     binary: bool,
+    /// Closes reported so far.
+    closes: u32,
+    /// How many of them came before the client first connected.
+    closes_before_connecting: Option<u32>,
 }
 
 impl Inbound {
+    /// The client has connected.
+    pub(crate) fn connected(&mut self) {
+        self.closes_before_connecting.get_or_insert(self.closes);
+    }
+
+    /// The client has reported the socket closed.
+    pub(crate) fn closed(&mut self) -> Incoming {
+        self.closes += 1;
+        Incoming::Closed(self.closes)
+    }
+
+    /// Whether the `n`th close ends the session.
+    ///
+    /// Any close after the client first connected does, including one the
+    /// client has since recovered from by connecting again on its own, ten
+    /// seconds later. A socket it brings back has no Phoenix channel on it, so
+    /// a session that stayed would be deaf while NervesHub showed the device
+    /// online, and nothing would notice: Phoenix answers heartbeats on a socket
+    /// whether or not anything has joined. The run loop doesn't read while a
+    /// download runs, so a reconnect can easily come before the close is read.
+    ///
+    /// A close before the first connection is an attempt that failed while
+    /// the transport was still waiting to connect, which the client retried
+    /// by itself.
+    pub(crate) fn ends_session(&self, n: u32) -> bool {
+        self.closes_before_connecting.is_some_and(|before| n > before)
+    }
+
     /// Take in one piece, and say what the run loop should hear of it, if
     /// anything.
     ///
@@ -87,7 +121,7 @@ impl Inbound {
                     }
                 }
             }
-            OPCODE_CLOSE => Some(Incoming::Closed),
+            OPCODE_CLOSE => Some(self.closed()),
             _ => None,
         }
     }
@@ -168,11 +202,51 @@ mod tests {
         assert_eq!(inbound.piece(frame(OPCODE_TEXT, true, &[0xff, 0xfe])), None);
     }
 
+    // The server's close frame and the client's own report of the socket going
+    // are both closes, numbered as they come.
     #[test]
-    fn a_close_frame_ends_the_socket() {
+    fn closes_are_numbered_as_they_come() {
         let mut inbound = Inbound::default();
 
-        assert_eq!(inbound.piece(frame(OPCODE_CLOSE, true, &[0x03, 0xe8])), Some(Incoming::Closed));
+        assert_eq!(inbound.piece(frame(OPCODE_CLOSE, true, &[0x03, 0xe8])), Some(Incoming::Closed(1)));
+        assert_eq!(inbound.closed(), Incoming::Closed(2));
+    }
+
+    #[test]
+    fn a_close_after_connecting_ends_the_session() {
+        let mut inbound = Inbound::default();
+        inbound.connected();
+
+        let Incoming::Closed(n) = inbound.closed() else { panic!("a close") };
+        assert!(inbound.ends_session(n));
+    }
+
+    // The case this exists for. The client reconnects ten seconds after the
+    // socket goes, by itself, and a run loop busy with a download reads the
+    // close after that: the client is connected again, but not to anything
+    // the session has joined.
+    #[test]
+    fn a_close_ends_the_session_even_once_the_client_has_reconnected() {
+        let mut inbound = Inbound::default();
+        inbound.connected();
+
+        let Incoming::Closed(n) = inbound.closed() else { panic!("a close") };
+        inbound.connected();
+
+        assert!(inbound.ends_session(n));
+    }
+
+    // An attempt that failed while the transport waited to connect, which
+    // the client then retried and got through.
+    #[test]
+    fn a_close_from_before_the_first_connection_is_passed_over() {
+        let mut inbound = Inbound::default();
+
+        let Incoming::Closed(n) = inbound.closed() else { panic!("a close") };
+        assert!(!inbound.ends_session(n), "read before the connection was reported");
+
+        inbound.connected();
+        assert!(!inbound.ends_session(n), "read after");
     }
 
     // The client answers pings itself.
