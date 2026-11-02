@@ -619,7 +619,9 @@ esp::agent_with(config, AlwaysApply)?
     .run()?;
 ```
 
-- **health** reports memory, WiFi RSSI and the reason for the last reset.
+- **health** reports memory, WiFi RSSI and the reason for the last reset. The
+  memory is internal RAM alone, here and in the console's `heap`: PSRAM is not
+  counted, since it is not what a device runs out of.
 - **geo** answers with a GeoIP position from the Nerves project's `whenwhere`
   service, the same one `nerves_hub_link` uses. Supply your own
   `LocationProvider` for a GNSS fix.

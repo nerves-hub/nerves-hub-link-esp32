@@ -363,17 +363,7 @@ pub mod device {
     use core::fmt::Write;
 
     pub fn heap(out: &mut Output) -> Result<(), Error> {
-        use esp_idf_svc::sys;
-
-        // SAFETY: all four are reads of allocator counters.
-        let (total, free, min_free, largest) = unsafe {
-            (
-                sys::heap_caps_get_total_size(sys::MALLOC_CAP_INTERNAL),
-                sys::esp_get_free_heap_size(),
-                sys::esp_get_minimum_free_heap_size(),
-                sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_INTERNAL),
-            )
-        };
+        let (total, free, min_free, largest) = crate::health::internal_heap();
 
         writeln!(out, "total     {total:>9}\r")?;
         writeln!(out, "free      {free:>9}\r")?;

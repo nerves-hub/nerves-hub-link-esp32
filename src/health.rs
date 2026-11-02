@@ -23,6 +23,14 @@
 //! which reads the same whether a fleet is stable or restarting hourly — the
 //! question it appears to answer is better answered by `reset_reason`.
 //!
+//! # Which memory
+//!
+//! Internal RAM, for every figure. It is the memory that runs out: stacks, DMA
+//! buffers and anything touched while the flash cache is off have to live there,
+//! so a board with megabytes of PSRAM free can still fail an allocation for want
+//! of a few kilobytes of it. PSRAM is left out rather than added in, because a
+//! percentage of both would sit near zero until the moment the device fell over.
+//!
 //! # CPU
 //!
 //! There is no supported way to measure CPU load on FreeRTOS without run-time
@@ -60,6 +68,10 @@ fn percent(used: u64, total: u64) -> f64 {
 ///
 /// Split out from the ESP-IDF calls so the arithmetic — which is where the
 /// mistakes are — can be checked on a desktop.
+///
+/// All four must describe the same memory. A free figure that counts more than
+/// the total does leaves nothing used, and the device reports 0% however full
+/// it is.
 pub fn memory_metrics(
     total_bytes: u64,
     free_bytes: u64,
@@ -112,6 +124,29 @@ pub fn reset_reason_name(reason: u32) -> &'static str {
     }
 }
 
+/// Total, free, lowest free and largest free block of internal RAM, in bytes.
+///
+/// One capability for all four, and the reason not to reach for the shorter
+/// `esp_get_free_heap_size()` and `esp_get_minimum_free_heap_size()`: those
+/// count whatever `malloc` can return, which includes PSRAM on a board that has
+/// it.
+#[cfg(target_os = "espidf")]
+pub(crate) fn internal_heap() -> (u64, u64, u64, u64) {
+    use esp_idf_svc::sys;
+
+    const CAPS: u32 = sys::MALLOC_CAP_INTERNAL;
+
+    // SAFETY: all four are reads of allocator counters.
+    unsafe {
+        (
+            sys::heap_caps_get_total_size(CAPS) as u64,
+            sys::heap_caps_get_free_size(CAPS) as u64,
+            sys::heap_caps_get_minimum_free_size(CAPS) as u64,
+            sys::heap_caps_get_largest_free_block(CAPS) as u64,
+        )
+    }
+}
+
 /// Health readings from the running device.
 #[cfg(target_os = "espidf")]
 pub struct EspHealth;
@@ -135,14 +170,7 @@ impl HealthProvider for EspHealth {
     fn report(&mut self) -> HealthReport {
         use esp_idf_svc::sys;
 
-        let (total, free, min_free, largest) = unsafe {
-            (
-                sys::heap_caps_get_total_size(sys::MALLOC_CAP_INTERNAL) as u64,
-                sys::esp_get_free_heap_size() as u64,
-                sys::esp_get_minimum_free_heap_size() as u64,
-                sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_INTERNAL) as u64,
-            )
-        };
+        let (total, free, min_free, largest) = internal_heap();
 
         let mut report = HealthReport::default();
         for (name, value) in memory_metrics(total, free, min_free, largest) {
@@ -249,8 +277,9 @@ mod tests {
         assert_eq!(metric(&metrics, "mem_used_percent"), 0.0);
     }
 
-    // Free heap above total would mean used underflows; saturating keeps the
-    // report sane rather than reporting a percentage near u64::MAX.
+    // Free heap above total means the figures are not of the same memory, which
+    // `internal_heap` is there to prevent. Should it happen anyway, saturating
+    // keeps the report sane rather than reporting a percentage near u64::MAX.
     #[test]
     fn free_above_total_does_not_underflow() {
         let metrics = memory_metrics(1_000, 2_000, 500, 500);
