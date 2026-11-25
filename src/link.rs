@@ -575,11 +575,16 @@ impl Link {
                 Ok(Action::None)
             }
 
-            UpdateDecision::Reschedule { delay_ms, reason } => {
+            UpdateDecision::Reschedule {
+                delay_minutes,
+                reason,
+            } => {
+                // `delay_for` is in minutes. A zero would put the device in
+                // the penalty box for no time at all.
                 self.send_status(
                     transport,
                     "rescheduled",
-                    json!({"delay_for": delay_ms, "reason": reason}),
+                    json!({"delay_for": delay_minutes.max(1), "reason": reason}),
                 )?;
                 Ok(Action::None)
             }
@@ -1014,13 +1019,12 @@ mod tests {
         assert_eq!(sent.payload["reason"], "on battery");
     }
 
-    #[test]
-    fn rescheduling_sends_the_delay_the_server_expects() {
+    fn reschedule(delay_minutes: u32) -> Message {
         let (mut link, mut transport) = (link(), FakeTransport::default());
         link.send_join(&mut transport, BootReport::default()).unwrap();
 
         let mut handler = Decider(UpdateDecision::Reschedule {
-            delay_ms: 60_000,
+            delay_minutes,
             reason: "busy".into(),
         });
 
@@ -1028,10 +1032,24 @@ mod tests {
         link.handle_frame(&mut transport, &mut handler, &frame)
             .unwrap();
 
-        let sent = transport.last();
+        transport.last()
+    }
+
+    #[test]
+    fn rescheduling_sends_the_delay_in_minutes() {
+        let sent = reschedule(15);
+
+        assert_eq!(sent.event, "status_update");
         assert_eq!(sent.payload["status"], "rescheduled");
-        // NervesHub reads `delay_for` in milliseconds.
-        assert_eq!(sent.payload["delay_for"], 60_000);
+        // NervesHub reads `delay_for` in minutes, as nerves_hub_link sends it.
+        // Milliseconds here would hold the device off for weeks.
+        assert_eq!(sent.payload["delay_for"], 15);
+        assert_eq!(sent.payload["reason"], "busy");
+    }
+
+    #[test]
+    fn a_zero_minute_reschedule_still_holds_the_device_off() {
+        assert_eq!(reschedule(0).payload["delay_for"], 1);
     }
 
     #[test]
