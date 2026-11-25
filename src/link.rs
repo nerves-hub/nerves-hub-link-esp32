@@ -12,7 +12,7 @@ use crate::extensions::{Extensions, LogLine, Outgoing, EXTENSIONS_TOPIC};
 use crate::message::{CONSOLE_TOPIC, CONSOLE_VERSION};
 use crate::message::{encode_frame, event, Frame, Message, RefGenerator, CONTROL_TOPIC, DEVICE_TOPIC};
 use crate::metadata::{BootReport, FirmwareMetadata};
-use crate::update::{Stage, UpdateDecision, UpdatePayload};
+use crate::update::{Stage, UpdateDecision, UpdatePayload, MIN_RESCHEDULE_MINUTES};
 
 /// A bidirectional frame channel. Implemented over `esp_websocket_client` on
 /// device, and over a queue in tests.
@@ -579,13 +579,18 @@ impl Link {
                 delay_minutes,
                 reason,
             } => {
-                // `delay_for` is in minutes. A zero would put the device in
-                // the penalty box for no time at all.
+                // `delay_for` is in minutes, and never under the minimum
+                // nerves_hub_link uses.
+                let delay_for = delay_minutes.max(MIN_RESCHEDULE_MINUTES);
                 self.send_status(
                     transport,
                     "rescheduled",
-                    json!({"delay_for": delay_minutes.max(1), "reason": reason}),
+                    json!({"delay_for": delay_for, "reason": reason}),
                 )?;
+
+                // What was sent, which is not what was asked for below the
+                // minimum.
+                log::info!("update rescheduled for {delay_for} min: {reason}");
                 Ok(Action::None)
             }
         }
@@ -1047,9 +1052,16 @@ mod tests {
         assert_eq!(sent.payload["reason"], "busy");
     }
 
+    /// nerves_hub_link never asks for less than five minutes, and neither does
+    /// this agent.
     #[test]
-    fn a_zero_minute_reschedule_still_holds_the_device_off() {
-        assert_eq!(reschedule(0).payload["delay_for"], 1);
+    fn a_reschedule_is_at_least_five_minutes() {
+        for asked in [0, 1, 4] {
+            let sent = reschedule(asked);
+            assert_eq!(sent.payload["delay_for"], 5, "asked for {asked}");
+        }
+
+        assert_eq!(reschedule(5).payload["delay_for"], 5);
     }
 
     #[test]

@@ -63,6 +63,11 @@ impl UpdatePayload {
     }
 }
 
+/// The shortest reschedule sent to NervesHub, in minutes. A shorter delay is
+/// raised to this, as nerves_hub_link does, so a device that asks for 0 is not
+/// offered the same update again straight away.
+pub const MIN_RESCHEDULE_MINUTES: u32 = 5;
+
 /// What the application wants done about an available update.
 ///
 /// `Ignore` and `Reschedule` map onto NervesHub statuses that it already
@@ -74,9 +79,9 @@ pub enum UpdateDecision {
     Ignore {
         reason: String,
     },
-    /// Hold the update off for `delay_minutes` whole minutes. NervesHub reads
-    /// the delay in minutes, as nerves_hub_link sends it. Zero is sent as one
-    /// minute, the shortest delay that holds the device off at all.
+    /// Hold the update off for `delay_minutes` whole minutes, the unit
+    /// NervesHub reads. Anything under [`MIN_RESCHEDULE_MINUTES`] (5) is sent
+    /// as 5.
     Reschedule {
         delay_minutes: u32,
         reason: String,

@@ -75,4 +75,4 @@ pub use link::{Action, AlwaysApply, Link, Transport, UpdateHandler};
 pub use message::{Frame, Serializer};
 pub use metadata::FirmwareMetadata;
 pub use tls_session::{Handshake, TlsSession};
-pub use update::{Stage, UpdateDecision, UpdatePayload};
+pub use update::{Stage, UpdateDecision, UpdatePayload, MIN_RESCHEDULE_MINUTES};
