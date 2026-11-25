@@ -21,7 +21,7 @@ fn main() -> Result<(), nerves_hub_link_esp32::Error> {
         fn update_available(&mut self, update: &UpdatePayload) -> UpdateDecision {
             if busy_with_real_work() {
                 UpdateDecision::Reschedule {
-                    delay_ms: 5 * 60 * 1000,
+                    delay_minutes: 5,
                     reason: "mid-measurement".into(),
                 }
             } else {

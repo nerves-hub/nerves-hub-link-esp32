@@ -71,8 +71,16 @@ impl UpdatePayload {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateDecision {
     Apply,
-    Ignore { reason: String },
-    Reschedule { delay_ms: u64, reason: String },
+    Ignore {
+        reason: String,
+    },
+    /// Hold the update off for `delay_minutes` whole minutes. NervesHub reads
+    /// the delay in minutes, as nerves_hub_link sends it. Zero is sent as one
+    /// minute, the shortest delay that holds the device off at all.
+    Reschedule {
+        delay_minutes: u32,
+        reason: String,
+    },
 }
 
 /// Where an update is in its lifecycle. Sent as the `stage` of an

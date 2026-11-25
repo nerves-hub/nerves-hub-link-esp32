@@ -141,8 +141,8 @@ struct Policy;
 impl UpdateHandler for Policy {
     fn update_available(&mut self, _update: &UpdatePayload) -> UpdateDecision {
         if mid_measurement() {
-            // Recorded server-side, and the device is held off for the delay.
-            UpdateDecision::Reschedule { delay_ms: 300_000, reason: "busy".into() }
+            // Recorded server-side, and the device is held off for five minutes.
+            UpdateDecision::Reschedule { delay_minutes: 5, reason: "busy".into() }
         } else {
             UpdateDecision::Apply
         }
